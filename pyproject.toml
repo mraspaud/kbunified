@@ -7,8 +7,8 @@ name = "kbunified"
 dynamic = ["version"]
 description = 'KBUnified'
 readme = "README.md"
-requires-python = ">=3.8"
-license = "GPLv3"
+requires-python = ">=3.12"
+license = "GPL-3.0+"
 keywords = []
 authors = [
   { name = "Martin Raspaud", email = "martin.raspaud@smhi.se" },
@@ -27,9 +27,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Documentation = "https://github.com/Martin Raspaud/kbunified#readme"
-Issues = "https://github.com/Martin Raspaud/kbunified/issues"
-Source = "https://github.com/Martin Raspaud/kbunified"
+Documentation = "https://github.com/maspaud/kbunified#readme"
+Issues = "https://github.com/mraspaud/kbunified/issues"
+Source = "https://github.com/mraspaud/kbunified"
 
 [tool.hatch.version]
 path = "src/kbunified/__about__.py"
@@ -59,3 +59,39 @@ exclude_lines = [
   "if __name__ == .__main__.:",
   "if TYPE_CHECKING:",
 ]
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+kbunified = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+python = "3.13.*"
+
+[tool.pixi.feature.test.dependencies]
+pytest = "*"
+pytest-asyncio = "*"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# See https://docs.astral.sh/ruff/rules/
+select = ["A", "B", "D", "E", "W", "F", "I", "N", "PT", "S", "TID", "C90", "Q", "T10", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert allowed in tests
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
