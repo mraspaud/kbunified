@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+from contextlib import suppress
 from urllib.parse import urlparse
 
 from rocketchat_async import RocketChat
 
-from kbunified.backends.interface import ChatBackend, create_event
+from kbunified.backends.interface import ChatBackend, Event, create_event
 
 logger = logging.getLogger("rocket.chat_backend")
 
@@ -49,20 +50,25 @@ class RocketChatBackend(ChatBackend):
         logger.debug("Rocket.Chat ready to roll")
         _ = await self._login_event.wait()
         channels = []
-        for channel_dict in await self._rc.get_channels_raw():
-            channel_type = channel_dict["t"]
-            channel_id = channel_dict["_id"]
-            if channel_type == "c":
-                chan = dict(name=channel_dict["fname"],
-                            id=channel_id)
-            elif channel_type == "d":
-                chan = dict(name=str(channel_dict["usernames"]),
-                            id=channel_id)
-            else:
-                raise NotImplementedError(f"Don't know how to handle channel type {channel_type}")
-            channels.append(chan)
-            await self._rc.subscribe_to_channel_messages_raw(channel_id, self.message_handler)
-            print("subbed")
+        try:
+            for channel_dict in await self._rc.get_channels_raw():
+                logger.debug(channel_dict)
+                channel_type = channel_dict["t"]
+                channel_id = channel_dict["_id"]
+                if channel_type == "c":
+                    chan = dict(name=channel_dict["fname"],
+                                id=channel_id)
+                elif channel_type == "d":
+                    chan = dict(name=str(channel_dict["usernames"]),
+                                id=channel_id)
+                else:
+                    raise NotImplementedError(f"Don't know how to handle channel type {channel_type}")
+                channels.append(chan)
+                await self._rc.subscribe_to_channel_messages_raw(channel_id, self.message_handler)
+                with suppress(KeyError):
+                    self.message_handler(channel_dict["lastMessage"])
+        except:
+            logger.exception("Error in channel listing")
 
         channel_list = create_event(event="channel_list",
                                     service=dict(name=self.name, id=self._service_id),
@@ -80,23 +86,38 @@ class RocketChatBackend(ChatBackend):
         """Shut down the backend."""
         self._running = False
 
+    def create_message_from_blob(self, blob) -> Event:
+        channel_id = blob["rid"]
+        author = blob["u"]["username"]
+        try:
+            body = blob["msg"]
+        except KeyError:
+            files = [f'{att["description"]}: [{att["title"]}](https://{self._base_url}{att["title_link"]})' for att in blob["attachments"]]
+            body = "\n".join(files)
+
+        event = create_event(event="message",
+                             channel_id=channel_id,
+                             service=dict(name=self.name, id=self._service_id),
+                             message=dict(body=body,
+                                          author=author,
+                                          id=blob["_id"]))
+
+        return event
+
     def message_handler(self, blob):
         logger.debug(blob)
         try:
-            channel_id = blob["rid"]
-            author = blob["u"]["username"]
-            try:
-                body = blob["msg"]
-            except KeyError:
-                files = [f'{att["description"]}: [{att["title"]}](https://{self._base_url}{att["title_link"]})' for att in blob["attachments"]]
-                body = "\n".join(files)
-
-            event = create_event(event="message",
-                                     channel_id=channel_id,
-                                     service=dict(name=self.name, id=self._service_id),
-                                     message=dict(body=str(body),
-                                                  author=author))
+            event = self.create_message_from_blob(blob)
             self._messages.put_nowait(event)
         except:
             logger.exception("message hanler crashed")
             raise
+
+
+def create_message(channel_id, service, body, author):
+    return create_event(event="message",
+                        channel_id=channel_id,
+                        service=service,
+                        message=dict(body=str(body),
+                                     author=author))
+
