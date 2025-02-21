@@ -72,10 +72,17 @@ kbunified = { path = ".", editable = true }
 [tool.pixi.dependencies]
 python = "3.13.*"
 typing_extensions = ">=4.12.2,<5"
+keyring = ">=25.6.0,<26"
+aiohttp = ">=3.11.12,<4"
+async-lru = ">=2.0.4,<3"
 
 [tool.pixi.feature.test.dependencies]
 pytest = "*"
 pytest-asyncio = "*"
+aioresponses = ">=0.7.8,<0.8"
+flask = ">=3.1.0,<4"
+requests = ">=2.32.3,<3"
+pyopenssl = ">=25.0.0,<26"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

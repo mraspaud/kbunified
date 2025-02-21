@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from contextlib import suppress
+from datetime import datetime
 from urllib.parse import urlparse
 
 from rocketchat_async import RocketChat
@@ -40,6 +41,8 @@ class RocketChatBackend(ChatBackend):
 
     async def post_message(self, channel_id, message):
         """Post a message"""
+        logger.debug(f"Posting {message} to {channel_id}")
+        await self._rc.send_message(message, channel_id)
 
     def get_subbed_channels(self):
         """Get the list of channels."""
@@ -77,34 +80,52 @@ class RocketChatBackend(ChatBackend):
 
         while self._running:
             yield await self._messages.get()
-            # try:
-            #     yield self._messages.get_nowait()
-            # except asyncio.QueueEmpty:
-            #     await asyncio.sleep(.5)
 
     def close(self):
         """Shut down the backend."""
         self._running = False
 
     def create_message_from_blob(self, blob) -> Event:
+        """Create a message from a blob dict."""
         channel_id = blob["rid"]
-        author = blob["u"]["username"]
+        user_info = blob["u"]
+        author = dict(id=user_info["_id"], username=user_info["username"],
+                      display_name=user_info["username"], full_name=user_info["name"])
+        logger.debug(blob["u"])
         try:
             body = blob["msg"]
         except KeyError:
-            files = [f'{att["description"]}: [{att["title"]}](https://{self._base_url}{att["title_link"]})' for att in blob["attachments"]]
+            files = [f'{att["description"]}: [{att["title"]}](https://{self._base_url}{att["title_link"]})'
+                     for att in blob["attachments"]]
             body = "\n".join(files)
+
+        ts = blob_to_time(blob["ts"]["$date"])
+
+        message = dict(body=body,
+                       author=author,
+                       id=blob["_id"],
+                       ts_date=ts.date().isoformat(),
+                       ts_time=ts.time().isoformat())
+
+        with suppress(KeyError):
+            message["thread_id"] = blob["tmid"]
+        with suppress(KeyError):
+            blob_date = blob["editedAt"]["$date"]
+            edt = blob_to_time(blob_date)
+            message["edit_date"] = edt.date().isoformat()
+            message["edit_time"] = edt.time().isoformat()
+        with suppress(KeyError):
+            message["reactions"] = {k.strip(":"):v["usernames"] for k, v in blob["reactions"].items()}
 
         event = create_event(event="message",
                              channel_id=channel_id,
                              service=dict(name=self.name, id=self._service_id),
-                             message=dict(body=body,
-                                          author=author,
-                                          id=blob["_id"]))
+                             message=message)
 
         return event
 
     def message_handler(self, blob):
+        """Handle incomming message."""
         logger.debug(blob)
         try:
             event = self.create_message_from_blob(blob)
@@ -114,10 +135,12 @@ class RocketChatBackend(ChatBackend):
             raise
 
 
-def create_message(channel_id, service, body, author):
-    return create_event(event="message",
-                        channel_id=channel_id,
-                        service=service,
-                        message=dict(body=str(body),
-                                     author=author))
+def blob_to_time(blob_date):
+    timestamp, milliseconds = divmod(blob_date, 1000)
+    edt = datetime.fromtimestamp(timestamp)
+    edt.replace(microsecond=milliseconds*1000)
+    return edt
+
+
+
 

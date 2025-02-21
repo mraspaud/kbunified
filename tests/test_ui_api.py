@@ -9,7 +9,7 @@ from os import fspath
 
 import pytest
 
-from kbunified.backends import Event
+from kbunified.backends.interface import Event
 from kbunified.ui import UIAPI, get_receive_socket, get_send_socket
 
 

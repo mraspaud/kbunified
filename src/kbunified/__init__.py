@@ -19,11 +19,9 @@ logger = logging.getLogger("main")
 async def merge_events(backends: Iterable[ChatBackend]) -> AsyncGenerator[Event]:
     """Merge events from multiple backends into a single async generator."""
     queue: asyncio.Queue[Event] = asyncio.Queue()
-    logger.debug("hello")
     async def pump_events(backend: ChatBackend):
         async for event in backend.events():
             await queue.put(event)
-    logger.debug("start pumping")
     tasks = [asyncio.create_task(pump_events(backend)) for backend in backends]
     try:
         while True:
@@ -73,9 +71,14 @@ async def main(args=None):
     await ui_api.start_command_reception_server()
     try:
         async for cmd in ui_api.receive_commands_from_ui():
+            if cmd.get("service_id") not in backends:
+                logger.debug("Don't know service, ignoring command.")
             if cmd["command"] == "post_message":
                 logger.debug(f"Sending message to {cmd['service_id']}")
                 await backends[cmd["service_id"]].post_message(cmd["channel_id"], cmd["body"])
+            if cmd["command"] == "switch_channel":
+                logger.debug(f"Switching channel on {cmd['service_id']}")
+                await backends[cmd["service_id"]].switch_channel(cmd["channel_id"])
     finally:
         # Shut down: signal backends to close and clean up the UI API.
         for backend in backends.values():
