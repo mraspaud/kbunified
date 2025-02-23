@@ -108,7 +108,6 @@ class SlackBackend(ChatBackend):
                 headers=self.get_headers(),
             ) as response:
                 data = await response.json()
-                logger.debug(data)
                 if data["ok"]:
                     self._logged_in = True
                     self._login_event.set()
@@ -289,6 +288,31 @@ class SlackBackend(ChatBackend):
             logger.exception("Something went wrong fetching history")
             raise
 
+    @alru_cache
+    async def fetch_thread(self, channel_id, thread_id):
+        async for message in self.fetch_thread_replies(channel_id, thread_id):
+            await self._inbox.put(message)
+
+    async def fetch_thread_replies(self,  channel_id, thread_id):
+        """Poll Slack for new replies asynchronously."""
+        try:
+            async with self._session.get(
+                "https://api.slack.com/api/conversations.replies",
+                headers=self.get_headers(),
+                params={"channel": channel_id, "ts": thread_id}
+            ) as response:
+                data = await response.json()
+                logger.debug(f"Got thread history for {channel_id}@{thread_id}")
+                if data.get("ok", False) and data.get("messages", []):
+                    for message in reversed(data["messages"]):
+                        logger.debug(message)
+                        if "channel" not in message:
+                            message["channel"] = channel_id
+                        # if "subtype" not in message:  # Ignore bot/system messages
+                        yield json.dumps(message)
+        except:
+            logger.exception("Something went wrong fetching thread")
+            raise
 
     def delete_message(self, blob):
         event = create_event(event="deleted_message",

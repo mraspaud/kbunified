@@ -79,6 +79,11 @@ async def main(args=None):
             if cmd["command"] == "switch_channel":
                 logger.debug(f"Switching channel on {cmd['service_id']}")
                 await backends[cmd["service_id"]].switch_channel(cmd["channel_id"])
+            if cmd["command"] == "fetch_thread":
+                logger.debug(f"Switching channel on {cmd['service_id']}")
+                await backends[cmd["service_id"]].fetch_thread(cmd["channel_id"], cmd["thread_id"])
+    except:
+        logger.exception("Bad command")
     finally:
         # Shut down: signal backends to close and clean up the UI API.
         for backend in backends.values():

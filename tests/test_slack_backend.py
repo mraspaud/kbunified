@@ -440,6 +440,70 @@ async def test_fetch_history(mock_aio):
     await sb.close()
 
 
+fake_replies = {"ok": True,
+                "messages": [{"user": "UGOODOLDME",
+                              "type": "message",
+                              "ts": "1740322860.950559",
+                              "client_msg_id": "0dfa9963-a809-4800-8a95-4e9e9f61326a",
+                              "text": "hej",
+                              "team": "THEATEAM",
+                              "thread_ts": "1740322860.950559",
+                              "reply_count": 2,
+                              "reply_users_count": 1,
+                              "latest_reply": "1740322900.605329",
+                              "reply_users": ["UGOODOLDME"],
+                              "is_locked": False,
+                              "subscribed": True,
+                              "last_read": "1740322900.605329",
+                              "blocks": [{"type": "rich_text",
+                                          "block_id": "83YUt",
+                                          "elements": [{"type": "rich_text_section",
+                                                        "elements": [{"type": "text",
+                                                                      "text": "hej"}]}]}]},
+                             {"user": "UGOODOLDME",
+                              "type": "message",
+                              "ts": "1740322890.536109",
+                              "client_msg_id": "062ec7ab-d733-4edb-add4-67cbfbcbb728",
+                              "text": "ja",
+                              "team": "THEATEAM",
+                              "thread_ts": "1740322860.950559",
+                              "parent_user_id": "UGOODOLDME",
+                              "blocks": [{"type": "rich_text",
+                                          "block_id": "nbAaG",
+                                          "elements": [{"type": "rich_text_section",
+                                                        "elements": [{"type": "text",
+                                                                      "text": "ja"}]}]}]},
+                             {"user": "UGOODOLDME",
+                              "type": "message",
+                              "ts": "1740322900.605329",
+                              "client_msg_id": "ce77eaf4-7983-4acb-9484-250447fc3f52",
+                              "text": "funkar?",
+                              "team": "THEATEAM",
+                              "thread_ts": "1740322860.950559",
+                              "parent_user_id": "UGOODOLDME",
+                              "blocks": [{"type": "rich_text",
+                                          "block_id": "+eSgM",
+                                          "elements": [{"type": "rich_text_section",
+                                                        "elements": [{"type": "text",
+                                                                      "text": "funkar?"}]}]}]}],
+                "has_more": False}
+
+@pytest.mark.asyncio
+# async def test_fetch_thread():
+async def test_fetch_thread(mock_aio):
+    """Test fetching channel history."""
+    sb = SlackBackend("some service", "Some Service")
+    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/conversations.replies?channel=some_channel&ts=1740322860.950559", status=200, payload=fake_replies)
+    await sb.fetch_thread("some_channel", "1740322860.950559")
+    messages = [sb._inbox.get_nowait() for i in range(3)]
+    msg = json.loads(messages[1])
+    assert msg["type"] == "message"
+    event = await sb.handle_event(msg)
+    assert event["message"]["body"] == "ja"
+    await sb.close()
+
+
 first_message = {"type": "message",
                  "channel": "CHANNELTOTEST",
                  "text": "hi",
@@ -476,6 +540,7 @@ edit_message = {"type": "message",
                 "hidden": True,
                 "ts": "1740060997.732449",
                 "event_ts": "1740061002.000200"}
+
 
 @pytest.mark.asyncio
 async def test_message_edited(mock_aio):
