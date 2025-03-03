@@ -45,7 +45,10 @@ rocket-chat = [
     "rocketchat-async",
 ]
 mattermost = [
+    "aiohttp>=3.11.12",
+    "browser-cookie3>=0.20.1",
     "mattermostdriver>=7.3.2",
+    "requests>=2.32.3",
 ]
 
 [tool.hatch.version]
