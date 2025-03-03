@@ -1,6 +1,7 @@
 """Tests for the slack backend."""
 
 import json
+from dataclasses import asdict
 
 import keyring
 import pytest
@@ -79,7 +80,7 @@ def mock_aio():
 async def test_message_handling(mock_aio):
     """Test regular message handling."""
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     message = {"type": "message",
                "channel": "DIRECT",
                "text": "<@UGOODOLDME> snt :grin:",
@@ -175,7 +176,7 @@ async def test_message_reply_handling(mock_aio):
               "ts": "1739879722.353889"}
 
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     event = await sb.handle_event(message)
     event2 = await sb.handle_event(reply1)
     assert "replies" in event2["message"]
@@ -197,7 +198,7 @@ async def test_message_reactions(mock_aio):
     reaction_to_1_remove_again = {"type": "reaction_removed", "user": "UGOODOLDME", "reaction": "grin", "item": {"type": "message", "channel": "CHANNELTOTEST", "ts": "1739888306.431719"}, "item_user": "UGOODOLDME", "event_ts": "1739898031.001200", "ts": "1739898031.001200"}
 
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     event1 = await sb.handle_event(message1)
     event2 = await sb.handle_event(message2)
     event2u = await sb.handle_event(reaction_to_2)
@@ -273,7 +274,7 @@ async def test_message_attachments(mock_aio):
                          "event_ts": "1739899061.907259",
                          "ts": "1739899061.907259"}
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     mock_aio.get("https://files.slack.com/files-pri/THEATEAM-FILETOTEST/screenshot_from_2025-02-05_15-16-41.png", status=200)
     event1 = await sb.handle_event(message_with_file)
     assert event1["message"]["body"] == ("attach\n![Screenshot from 2025-02-05 15-16-41.png]"
@@ -285,7 +286,7 @@ async def test_post_message(mock_aio, monkeypatch):
     def dummy_kr(group, item):
         return f"{group}:{item}"
     monkeypatch.setattr(keyring, "get_password", dummy_kr)
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     message = {"type": "message",
                "channel": "DIRECT",
                "text": "<@UGOODOLDME> snt :grin:",
@@ -331,11 +332,11 @@ async def test_delete_message(mock_aio):
                        "event_ts": "1739917830.006200",
                        "ts": "1739917830.006200"}
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     event1 = await sb.handle_event(deleted_message)
     assert event1["event"] == "deleted_message"
     assert event1["channel_id"] == "CHANNELTOTEST"
-    assert event1["message"]["id"] == "1739902122.384779"
+    assert event1["message_id"] == "1739902122.384779"
     await sb.close()
 
 
@@ -383,12 +384,12 @@ async def test_fetch_channels(mock_aio):
     mock_aio.post("https://api.slack.com/api/client.counts", status=200, payload=fake_counts)
     channels = await sb.get_subbed_channels()
     assert len(channels) == 2
-    tchan = channels[0]
+    tchan = asdict(channels[0])
     assert tchan["name"] == "test"
     assert tchan["unread"] is False
     assert tchan["topic"] == "For testing"
     assert tchan["starred"] is True
-    achan = channels[1]
+    achan = asdict(channels[1])
     assert achan["name"] == "another"
     assert achan["unread"] is True
     assert achan["mentions"] == 2
@@ -441,7 +442,7 @@ fake_history = {"ok": True,
 async def test_fetch_history(mock_aio):
     """Test fetching channel history."""
     sb = SlackBackend("some service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     mock_aio.get("https://api.slack.com/api/conversations.history?channel=some_channel&limit=4", status=200, payload=fake_history)
     await sb.switch_channel("some_channel", limit=4)
     messages = [sb._inbox.get_nowait() for i in range(4)]
@@ -514,7 +515,7 @@ fake_replies = {"ok": True,
 async def test_fetch_thread(mock_aio):
     """Test fetching channel history."""
     sb = SlackBackend("some service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     mock_aio.get("https://api.slack.com/api/conversations.replies?channel=some_channel&ts=1740322860.950559", status=200, payload=fake_replies)
     await sb.fetch_thread("some_channel", "1740322860.950559")
     messages = [sb._inbox.get_nowait() for i in range(3)]
@@ -567,7 +568,7 @@ edit_message = {"type": "message",
 async def test_message_edited(mock_aio):
     """Test regular message handling."""
     sb = SlackBackend("some_service", "Some Service")
-    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
     event = await sb.handle_event(first_message)
     assert event is not None
     assert event["event"] == "message"
