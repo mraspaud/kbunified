@@ -285,13 +285,34 @@ async def test_post_message(mock_aio, monkeypatch):
     def dummy_kr(group, item):
         return f"{group}:{item}"
     monkeypatch.setattr(keyring, "get_password", dummy_kr)
+    mock_aio.post("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    message = {"type": "message",
+               "channel": "DIRECT",
+               "text": "<@UGOODOLDME> snt :grin:",
+               "blocks": [{"type": "rich_text",
+                           "block_id": "tvjUX",
+                           "elements": [{"type": "rich_text_section",
+                                         "elements": [{"type": "text",
+                                                       "text": "snt :grin:"}]}]}],
+               "user": "UGOODOLDME",
+               "client_msg_id": "de6d0d0c-a83f-4dcd-9d6d-2210e2224f3b",
+               "team": "THEATEAM",
+               "source_team": "THEATEAM",
+               "user_team": "THEATEAM",
+               "suppress_notification": False,
+               "event_ts": "1739811627.945739",
+               "ts": "1739811627.945739"}
     sb = SlackBackend("some_service", "Some Service")
+    await sb.handle_event(message)
     mock_aio.post("https://api.slack.com/api/chat.postMessage", status=200, payload=dict(ok="yep"))
     channel = "CHANNELTOTEST"
-    text = "hello world"
-    resp = await sb.post_message(channel, text)
-    mock_aio.assert_called_once_with("https://api.slack.com/api/chat.postMessage", method="POST",
-                                     headers=sb.get_headers(), json=dict(channel=channel, text=text))
+    text = "hello @goodoldme"
+    await sb.post_message(channel, text)
+    modified_text = "hello <@UGOODOLDME>"
+    mock_aio.assert_called_with("https://api.slack.com/api/chat.postMessage", method="POST",
+                                headers=sb.get_headers(),
+                                ssl=sb.ssl_ctx,
+                                json=dict(channel=channel, text=modified_text))
     await sb.close()
 
 @pytest.mark.asyncio
@@ -555,6 +576,7 @@ async def test_message_edited(mock_aio):
     assert msg["ts_date"] == "2025-02-20"
     assert msg["ts_time"] == "15:16:37.732449"
 
+
     event = await sb.handle_event(edit_message)
     assert event is not None
     assert event["event"] == "message"
@@ -564,6 +586,7 @@ async def test_message_edited(mock_aio):
     assert msg["ts_time"] == "15:16:37.732449"
     assert msg["edit_time"] == "15:16:42"
     await sb.close()
+
 
 #####
 # reply with copy to channel, then change reply

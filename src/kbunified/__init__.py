@@ -82,6 +82,9 @@ async def main(args=None):
             if cmd["command"] == "fetch_thread":
                 logger.debug(f"Switching channel on {cmd['service_id']}")
                 await backends[cmd["service_id"]].fetch_thread(cmd["channel_id"], cmd["thread_id"])
+            if cmd["command"] == "react":
+                logger.debug(f"Reacting to message in {cmd['service_id']}")
+                await backends[cmd["service_id"]].send_reaction(cmd["channel_id"], cmd["message_id"], cmd["reaction"])
     except:
         logger.exception("Bad command")
     finally:

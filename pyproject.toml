@@ -24,12 +24,29 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = ["rocketchat-async>=4.2.0,<5"]
+dependencies = [
+    "truststore>=0.10.1",
+]
 
 [project.urls]
 Documentation = "https://github.com/maspaud/kbunified#readme"
 Issues = "https://github.com/mraspaud/kbunified/issues"
 Source = "https://github.com/mraspaud/kbunified"
+
+[project.optional-dependencies]
+slack = [
+    "aiohttp>=3.11.12",
+    "truststore>=0.10.1",
+    "async-lru>=2.0.4",
+    "importlib-resources>=6.5.2",
+    "keyring>=25.6.0",
+]
+rocket-chat = [
+    "rocketchat-async",
+]
+mattermost = [
+    "mattermostdriver>=7.3.2",
+]
 
 [tool.hatch.version]
 path = "src/kbunified/__about__.py"
@@ -60,34 +77,6 @@ exclude_lines = [
   "if TYPE_CHECKING:",
 ]
 
-[tool.pixi.project]
-channels = ["conda-forge"]
-platforms = ["linux-64"]
-
-[tool.pixi.pypi-dependencies]
-kbunified = { path = ".", editable = true }
-
-[tool.pixi.tasks]
-
-[tool.pixi.dependencies]
-python = "3.13.*"
-typing_extensions = ">=4.12.2,<5"
-keyring = ">=25.6.0,<26"
-aiohttp = ">=3.11.12,<4"
-async-lru = ">=2.0.4,<3"
-
-[tool.pixi.feature.test.dependencies]
-pytest = "*"
-pytest-asyncio = "*"
-aioresponses = ">=0.7.8,<0.8"
-flask = ">=3.1.0,<4"
-requests = ">=2.32.3,<3"
-pyopenssl = ">=25.0.0,<26"
-
-[tool.pixi.environments]
-default = { solve-group = "default" }
-test = { features = ["test"], solve-group = "default" }
-
 [tool.ruff]
 line-length = 120
 
@@ -103,3 +92,16 @@ convention = "google"
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.uv.sources]
+rocketchat-async = { path = "../../contrib/rocketchat-async", editable = true }
+
+[dependency-groups]
+dev = [
+    "aioresponses>=0.7.8",
+    "browser-cookie3>=0.20.1",
+    "ldap3>=2.9.1",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.3",
+    "python-ldap>=3.4.4",
+]

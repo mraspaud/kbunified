@@ -2,10 +2,12 @@
 
 import asyncio
 import logging
+import ssl
 from contextlib import suppress
 from datetime import datetime
 from urllib.parse import urlparse
 
+import truststore
 from rocketchat_async import RocketChat
 
 from kbunified.backends.interface import ChatBackend, Event, create_event
@@ -27,6 +29,8 @@ class RocketChatBackend(ChatBackend):
         self._messages = asyncio.Queue()
         self._running = True
         self._base_url = urlparse(service_url).hostname
+        self.ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
 
     def is_logged_in(self):
         """Return logged in status."""
@@ -34,7 +38,7 @@ class RocketChatBackend(ChatBackend):
 
     async def login(self):
         """Log in."""
-        await self._rc.resume(self._service_url, self._userid, self._token)
+        await self._rc.resume(self._service_url, self._userid, self._token, ssl=self.ssl_ctx)
         self._logged_in = True
         self._login_event.set()
         logger.debug(f"logged in {self.name}")
