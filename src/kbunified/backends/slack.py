@@ -157,11 +157,18 @@ class SlackBackend(ChatBackend):
             else:
                 return data
 
-    async def post_message(self, channel_id, message_text):
+    async def post_message(self, channel_id, message_text, thread_id=None):
         """Post a message to a Slack channel."""
         modified_body = self.replace_usernames_with_id(message_text)
-        data = await self._post("chat.postMessage", channel=channel_id, text=modified_body)
+        if thread_id:
+            data = await self._post("chat.postMessage", channel=channel_id, text=modified_body, thread_ts=thread_id)
+        else:
+            data = await self._post("chat.postMessage", channel=channel_id, text=modified_body)
         return data
+
+    async def post_reply(self, channel_id, message_text, thread_id):
+        """Post a message to a Slack channel."""
+        return await self.post_message(channel_id, message_text, thread_id)
 
     async def send_reaction(self, channel_id, message_id, reaction):
         """Send a reaction to a Slack channel."""

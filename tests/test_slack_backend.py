@@ -316,6 +316,45 @@ async def test_post_message(mock_aio, monkeypatch):
                                 json=dict(channel=channel, text=modified_text))
     await sb.close()
 
+
+@pytest.mark.asyncio
+async def test_post_reply(mock_aio, monkeypatch):
+    """Test posting a reply."""
+    def dummy_kr(group, item):
+        return f"{group}:{item}"
+    monkeypatch.setattr(keyring, "get_password", dummy_kr)
+    mock_aio.get("https://api.slack.com/api/users.info?user=UGOODOLDME", status=200, body=json.dumps(fake_user_fetch))
+    thread_id = "1739811627.945739"
+    message = {"type": "message",
+               "channel": "DIRECT",
+               "text": "<@UGOODOLDME> snt :grin:",
+               "blocks": [{"type": "rich_text",
+                           "block_id": "tvjUX",
+                           "elements": [{"type": "rich_text_section",
+                                         "elements": [{"type": "text",
+                                                       "text": "snt :grin:"}]}]}],
+               "user": "UGOODOLDME",
+               "client_msg_id": "de6d0d0c-a83f-4dcd-9d6d-2210e2224f3b",
+               "team": "THEATEAM",
+               "source_team": "THEATEAM",
+               "user_team": "THEATEAM",
+               "suppress_notification": False,
+               "event_ts": thread_id,
+               "ts": thread_id}
+    sb = SlackBackend("some_service", "Some Service")
+    await sb.handle_event(message)
+    mock_aio.post("https://api.slack.com/api/chat.postMessage", status=200, payload=dict(ok="yep"))
+    channel = "CHANNELTOTEST"
+    text = "hello @goodoldme"
+    await sb.post_reply(channel, text, thread_id)
+    modified_text = "hello <@UGOODOLDME>"
+    mock_aio.assert_called_with("https://api.slack.com/api/chat.postMessage", method="POST",
+                                headers=sb.get_headers(),
+                                ssl=sb.ssl_ctx,
+                                json=dict(channel=channel, text=modified_text, thread_ts=thread_id))
+    await sb.close()
+
+
 @pytest.mark.asyncio
 async def test_delete_message(mock_aio):
     deleted_message = {"type": "message",
