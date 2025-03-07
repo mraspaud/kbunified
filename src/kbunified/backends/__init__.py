@@ -3,6 +3,7 @@
 import logging
 
 from kbunified.backends.interface import ChatBackend
+from kbunified.backends.mattermost import MattermostBackend
 from kbunified.backends.rocketchat import RocketChatBackend
 from kbunified.backends.slack import SlackBackend
 
@@ -21,6 +22,8 @@ def chat_backends_from_config(**services: dict[str, object]) -> list[ChatBackend
             backends[service_id] = RocketChatBackend(service_id, **config)
         elif btype == "slack":
             backends[service_id] = SlackBackend(service_id, **config)
+        elif btype == "mattermost":
+            backends[service_id] = MattermostBackend(service_id, **config)
         else:
             raise NotImplementedError(f"Do not know how to communicate to {btype}")
     return backends

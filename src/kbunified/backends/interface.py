@@ -22,8 +22,10 @@ class ChatBackend(ABC):
     """Chat backend."""
 
     @abstractmethod
-    def __init__(self, service_id: str):
+    def __init__(self, service_id: str, service_name: str):
         """Set up the backend."""
+        self._service_id = service_id
+        self.name = service_name
 
     @abstractmethod
     async def login(self):
@@ -48,6 +50,10 @@ class ChatBackend(ABC):
         """Post a message."""
 
     @abstractmethod
+    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str):
+        """Reply to a message."""
+
+    @abstractmethod
     async def send_reaction(self, channel_id: ChannelID, message_id: str, reaction: str):
         """React to a message."""
 
@@ -67,6 +73,11 @@ class ChatBackend(ABC):
     async def close(self):
         """Close the connection to the service and shut down."""
 
+    def create_event(self, event, **fields) -> Event:
+        """Create an event from this service."""
+        return create_event(event=event,
+                            service=dict(name=self.name, id=self._service_id),
+                            **fields)
 
 def create_channel(channel_id: str, name: str, topic: str,
                    unread: bool = False, mentions: int = 0, starred: bool = False):

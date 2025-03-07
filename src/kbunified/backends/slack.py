@@ -166,7 +166,7 @@ class SlackBackend(ChatBackend):
             data = await self._post("chat.postMessage", channel=channel_id, text=modified_body)
         return data
 
-    async def post_reply(self, channel_id, message_text, thread_id):
+    async def post_reply(self, channel_id, thread_id, message_text):
         """Post a message to a Slack channel."""
         return await self.post_message(channel_id, message_text, thread_id)
 
@@ -233,8 +233,8 @@ class SlackBackend(ChatBackend):
 
     async def events(self) -> AsyncGenerator[Event]:
         """Event generator (polling for new messages)."""
-        logger.debug("Slack backend ready to roll")
         await self._login_event.wait()
+        logger.debug("Slack backend ready to roll")
 
         await self.connect_ws()
 
@@ -368,6 +368,7 @@ class SlackBackend(ChatBackend):
             message = dict(body=body,
                            author=author,
                            id=message_id,
+                           timestamp=timestamp,
                            ts_date=ts_date,
                            ts_time=ts_time)
 

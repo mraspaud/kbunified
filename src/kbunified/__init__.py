@@ -78,12 +78,12 @@ async def main(args=None):
                 await backends[cmd["service_id"]].post_message(cmd["channel_id"], cmd["body"])
             if cmd["command"] == "post_reply":
                 logger.debug(f"Sending reply to {cmd['service_id']}")
-                await backends[cmd["service_id"]].post_reply(cmd["channel_id"], cmd["body"], cmd["thread_id"])
+                await backends[cmd["service_id"]].post_reply(cmd["channel_id"], cmd["thread_id"], cmd["body"])
             if cmd["command"] == "switch_channel":
                 logger.debug(f"Switching channel on {cmd['service_id']}")
                 await backends[cmd["service_id"]].switch_channel(cmd["channel_id"])
             if cmd["command"] == "fetch_thread":
-                logger.debug(f"Switching channel on {cmd['service_id']}")
+                logger.debug(f"Fetch thread on {cmd['service_id']}")
                 await backends[cmd["service_id"]].fetch_thread(cmd["channel_id"], cmd["thread_id"])
             if cmd["command"] == "react":
                 logger.debug(f"Reacting to message in {cmd['service_id']}")
