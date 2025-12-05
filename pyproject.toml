@@ -25,7 +25,11 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
+    "async-lru[slack]>=2.0.4",
+    "importlib-resources[slack]>=6.5.2",
+    "requests[mattermost]>=2.32.3",
     "truststore>=0.10.1",
+    "websockets>=13.0",
 ]
 
 [project.urls]
@@ -41,9 +45,7 @@ slack = [
     "importlib-resources>=6.5.2",
     "keyring>=25.6.0",
 ]
-rocket-chat = [
-    "rocketchat-async",
-]
+rocket-chat = []
 mattermost = [
     "aiohttp>=3.11.12",
     "browser-cookie3>=0.20.1",

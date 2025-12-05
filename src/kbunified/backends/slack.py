@@ -84,7 +84,6 @@ class SlackBackend(ChatBackend):
         self._session_cookie = keyring.get_password("kbunified-slack", "session_cookie")
         if not self._session_cookie:
             raise RuntimeError("No Slack cookie found.")
-
         extra_args = ""
         self._ws_url = f"wss://wss-primary.slack.com/?token={self._session_token}{extra_args}"
 
@@ -92,26 +91,28 @@ class SlackBackend(ChatBackend):
         self._message_cache = dict()
         self._user_id_name = dict()
         self._user_name_id = dict()
-
+        self._users = dict()
 
     async def is_logged_in(self):
         """Return logged-in status."""
         return self._logged_in
 
     async def connect_ws(self):
+        ua_firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+        ua_chrome = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         headers = {
                     "Origin": "https://app.slack.com",
-                    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                   "Chrome/132.0.0.0 Safari/537.36"),
-                    "Cookie": f"d={self._session_cookie}"
+                    "User-Agent": ua_firefox,
+                    # "Cookie": f"d={self._session_cookie}"
                 }
 
         logger.debug("Connecting to Slack WebSocket")
-        self._ws = await websockets.connect(self._ws_url, extra_headers=headers, ssl=self.ssl_ctx)
+        self._ws = await websockets.connect(self._ws_url, additional_headers=headers, ssl=self.ssl_ctx)
+        logger.debug("Connected")
         return self._ws
 
     def get_headers(self) -> dict[str, str]:
+        """Get the headers for the requests."""
         return {"Cookie": f"d={self._session_cookie}",
                 "Authorization": f"Bearer {self._session_token}"}
 
@@ -200,7 +201,7 @@ class SlackBackend(ChatBackend):
                                     omit_channels=False, include_min_version_bumf_check=1,
                                     _x_app_name="client")
             counts = await self._post("client.counts")
-            metadata = {count["id"]: count for count in counts["channels"]}
+            metadata = {count["id"]: count for count in counts["channels"] + counts["ims"]}
 
             for channel in data["channels"]:
                 if channel["is_archived"]:
@@ -219,6 +220,26 @@ class SlackBackend(ChatBackend):
                                starred=starred)
                 logger.debug(f"added {chan}")
                 channels.append(chan)
+            for im in data["ims"]:
+                if im["is_archived"]:
+                    continue
+                try:
+                    user_name = username(self._users[im["user"]])
+                except KeyError:
+                    continue
+                channel_id = im["id"]
+                unread = metadata.get(channel_id, dict()).get("has_unreads", False)
+                mentions = metadata.get(channel_id, dict()).get("mention_count", 0)
+                starred = channel_id in data.get("starred", list())
+
+                chan = Channel(id=channel_id,
+                               name=user_name,
+                               topic=f"Conversation with {user_name}",
+                               unread=unread,
+                               mentions=mentions,
+                               starred=starred)
+                logger.debug(f"added im {chan}")
+                channels.append(chan)
             return channels
         except:
             logger.exception("building channel list failed")
@@ -230,7 +251,7 @@ class SlackBackend(ChatBackend):
                             service=dict(name=self.name, id=self._service_id),
                             **fields)
 
-
+    # @overload
     async def events(self) -> AsyncGenerator[Event]:
         """Event generator (polling for new messages)."""
         await self._login_event.wait()
@@ -238,7 +259,8 @@ class SlackBackend(ChatBackend):
 
         await self.connect_ws()
 
-        # Fetch channels
+        # Fetch users and channels
+        await self.fetch_all_users()
         channels = await self.get_subbed_channels()
 
         channel_list = self.create_event(event="channel_list",
@@ -286,28 +308,44 @@ class SlackBackend(ChatBackend):
         if json_data["type"] == "reaction_removed":
             return self.unreact_to_message(json_data)
 
-    @alru_cache(maxsize=2048)
-    async def fetch_user(self, user_id):
-        data = await self._get("users.info", user=user_id)
-        display_name = username(data["user"])
+    def register_user(self, user_info):
+        user_id = user_info["id"]
+        display_name = username(user_info)
         self._user_id_name[user_id] = display_name
         self._user_name_id[display_name] = user_id
-        return data["user"]
+        self._users[user_id] = user_info
+
+    async def fetch_all_users(self):
+        if not self._users:
+            data = await self._get("users.list")
+            for user in data["members"]:
+                self.register_user(user)
+
+    async def fetch_user(self, user_id):
+        return self._users[user_id]
 
     @alru_cache
     async def switch_channel(self, channel_id, limit=20):
-        async for message in self.fetch_messages(channel_id, limit):
+        """Switch channel."""
+        view = await self._post("conversations.view", channel=channel_id, count=limit, ignore_replies=True)
+        unread_count = view.get("channel", view.get("group"))["unread_count"]
+        async for message in self.fetch_messages(channel_id, view["history"], unread_count):
             await self._inbox.put(message)
 
-    async def fetch_messages(self,  channel_id, limit=20):
+    async def fetch_messages(self,  channel_id, data, unread_count):
         """Poll Slack for new messages asynchronously."""
         try:
-            data = await self._get("conversations.history", channel=channel_id,  limit=limit)
             logger.debug(f"Got conversation history for {channel_id}")
-            for message in reversed(data.get("messages", [])):
-                logger.debug(message)
+            logger.debug(f"Unread count {unread_count}")
+            message_list = data.get("messages", [])
+            unread_count -= len(message_list)
+            for message in reversed(message_list):
                 if "channel" not in message:
                     message["channel"] = channel_id
+                unread_count += 1
+                if unread_count > 0:
+                    message["unread"] = True
+                logger.debug(message)
                 yield json.dumps(message)
         except:
             logger.exception("Something went wrong fetching history")
@@ -388,10 +426,19 @@ class SlackBackend(ChatBackend):
 
                     files.append(f"![{attachment["title"]}]({str(path)})")
                 message["body"] += "\n" + "\n".join(files)
+            with suppress(KeyError):
+                attachments = blob["attachments"]
+                for attachment in attachments:
+                    message["body"] += attachment["pretext"] + "\n"
+                    message["body"] += attachment["title"] + "\n"
+                    message["body"] += await self.replace_mentions_in_text(attachment["text"]) + "\n"
+                    message["body"] += attachment["footer"] + "\n"
             if "edited" in blob:
                 blob_dt = float(blob["edited"]["ts"])
                 edt = self.blob_to_time(blob_dt)
                 message["edit_date"], message["edit_time"] = edt
+            if "unread" in blob:
+                message["unread"] = True
 
             event = create_event(event="message",
                                  channel_id=channel_id,
@@ -456,8 +503,13 @@ class SlackBackend(ChatBackend):
     async def delete_message(self, channel_id: ChannelID, message_id: str):
         return await super().delete_message(channel_id, message_id)
 
+    async def mark_channel_read(self, channel_id, message_id):
+        """Mark a Slack channel as read."""
+        data = await self._post("conversations.mark", channel=channel_id, ts=message_id)
+        return data
+
 def username(user_info):
-    return user_info["profile"]["display_name"] or user_info["real_name"]
+    return user_info["profile"]["display_name"] or user_info.get("real_name")
 
 
 

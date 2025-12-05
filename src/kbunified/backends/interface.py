@@ -66,8 +66,26 @@ class ChatBackend(ABC):
         """Iterate over events."""
 
     @abstractmethod
-    async def switch_channel(self, channel_id: ChannelID):
+    async def switch_channel(self, channel_id: ChannelID, after: str|None = None):
         """Switch to given channel."""
+
+    @abstractmethod
+    async def update_message(self, channel_id: ChannelID, message_id: str, new_text: str):
+        """Update an existing message."""
+
+    @abstractmethod
+    async def remove_reaction(self, channel_id: ChannelID, message_id: str, reaction: str):
+        """Remove a reaction."""
+
+    async def fetch_thread(self, channel_id: ChannelID, thread_id: str, after: str|None = None):
+        """Fetch messages from a thread."""
+        del channel_id, thread_id
+        raise NotImplementedError
+
+    async def mark_channel_read(self, channel_id: ChannelID, message_id: str):
+        """Fetch messages from a thread."""
+        del channel_id, message_id
+        raise NotImplementedError
 
     @abstractmethod
     async def close(self):

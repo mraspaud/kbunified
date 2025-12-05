@@ -4,12 +4,11 @@ import logging
 
 from kbunified.backends.interface import ChatBackend
 from kbunified.backends.mattermost import MattermostBackend
-from kbunified.backends.rocketchat import RocketChatBackend
 from kbunified.backends.slack import SlackBackend
 
 logger = logging.getLogger("backend")
 
-def chat_backends_from_config(**services: dict[str, object]) -> list[ChatBackend]:
+def chat_backends_from_config(**services: dict[str, str]) -> dict[str, ChatBackend]:
     """Create a backend from the config."""
     backends = dict()
     for service_id, config in services.items():
@@ -19,6 +18,7 @@ def chat_backends_from_config(**services: dict[str, object]) -> list[ChatBackend
             from kbunified.backends.dummy import DummyBackend
             backends[service_id] = DummyBackend(service_id, **config)
         elif btype == "rocket.chat":
+            from kbunified.backends.rocketchat import RocketChatBackend
             backends[service_id] = RocketChatBackend(service_id, **config)
         elif btype == "slack":
             backends[service_id] = SlackBackend(service_id, **config)

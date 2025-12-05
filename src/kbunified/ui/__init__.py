@@ -1,86 +1,111 @@
-"""UI API."""
+"""UI API (WebSocket Implementation)."""
 
+import asyncio
 import json
 import logging
-from asyncio import Queue, start_unix_server
+from asyncio import Queue
 from collections.abc import AsyncGenerator
-from contextlib import suppress
-from functools import cache, partial
-from pathlib import Path
-from tempfile import gettempdir
+from dataclasses import asdict, is_dataclass
 
+# Check version for correct import
+try:
+    from websockets.asyncio.server import serve
+except ImportError:
+    from websockets import serve
+import websockets
+
+# Assuming these exist in your project structure
 from kbunified.backends.interface import Command, Event
 
 logger = logging.getLogger("ui")
 
-
-@cache
-def get_send_socket():
-    """Get the socket for sending."""
-    return Path(gettempdir()) / "kb_events.sock"
-
-@cache
-def get_receive_socket():
-    """Get the socket for sending."""
-    return Path(gettempdir()) / "kb_commands.sock"
-
 class UIAPI:
-    """The ui api class."""
+    """The ui api class using WebSockets."""
 
     def __init__(self):
-        """Set up the ui api."""
-        self._send_server = None
-        self._receive_server = None
+        self._server_task = None
         self._command_q: Queue[Command] = Queue()
+        self.connected_clients = set()
 
-    async def send_events_to_ui(self, events: AsyncGenerator[Event]):
-        """Send events to the ui."""
-        sender_cb = partial(sender, events)
-        self._send_server = await start_unix_server(sender_cb, get_send_socket())
-        logger.debug("sender started")
+        self._channel_lists = []
+        self._handshakes = []
 
-    async def close(self):
-        """Close servers."""
-        logger.debug("Closing ui")
-        with suppress(AttributeError):
-            self._send_server.close()
-            await self._send_server.wait_closed()
-        with suppress(AttributeError):
-            self._receive_server.close()
-            await self._receive_server.wait_closed()
+    async def _websocket_handler(self, websocket, path=None):
+        """Handles a single WebSocket connection.
+        """
+        self.connected_clients.add(websocket)
+        logger.debug("UI Client connected")
+
+        for handshake in self._handshakes:
+            await websocket.send(handshake)
+        for chlist in self._channel_lists:
+            await websocket.send(chlist)
+
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    if isinstance(data, dict):
+                        command: Command = data
+                        await self._command_q.put(command)
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode JSON from UI")
+        except Exception as e:
+            logger.debug(f"Connection closed: {e}")
+        finally:
+            self.connected_clients.remove(websocket)
+            logger.debug("UI Client disconnected")
 
     async def start_command_reception_server(self):
-        """Start the command-reception server."""
-        self._receive_server = await start_unix_server(self._recv, get_receive_socket())
-        logger.debug("command receiver started")
+        logger.info("Starting WebSocket server on ws://127.0.0.1:8000")
+        self._server = await serve(self._websocket_handler, "127.0.0.1", 8000)
+        await self._server.wait_closed()
 
-    async def _recv(self, reader, writer):
-        """Receive one command through the socket and quit."""
-        while True:
-            line: bytes = await reader.readline()
-            if not line:
-                break
-            logger.debug(f"got command: {line}")
+    async def send_events_to_ui(self, events: AsyncGenerator[Event, None]):
+        """Consume backend events eagerly and broadcast.
+        Does NOT block, so the backend can keep running logic (like starting WS listeners).
+        """
+        logger.debug("Event broadcaster started")
+
+        async for item in events:
             try:
-                command: Command = json.loads(line.decode().strip())
-                await self._command_q.put(command)
-            except json.JSONDecodeError:
-                pass
-        writer.close()
-        await writer.wait_closed()
+                # 1. Serialize
+                if is_dataclass(item):
+                    data = asdict(item)
+                else:
+                    data = item
 
-    async def receive_commands_from_ui(self):
-        """Receive commands from the ui."""
+                payload = json.dumps(data)
+
+                # 2. Cache Critical State
+                # We save this so late-joining clients aren't empty
+                if data.get("event") == "self_info": # <--- 3. NEW: Cache the handshake
+                        self._handshakes.append(payload)
+                        logger.debug("Cached identity handshake")
+                elif isinstance(data, dict) and data.get("event") == "channel_list":
+                    self._channel_lists.append(payload)
+                    logger.debug("Cached channel list")
+
+                # 3. Broadcast (if anyone is home)
+                if self.connected_clients:
+                    websockets.broadcast(self.connected_clients, payload)
+                    logger.debug(f"Broadcasted event: {data.get('event', 'unknown')}")
+                else:
+                    # If no one is listening, we drop the message (except for the cache above).
+                    # This keeps the backend loop moving.
+                    logger.debug(f"Buffered/Dropped event (no clients): {data.get('event', 'unknown')}")
+
+            except Exception as e:
+                logger.error(f"Error broadcasting event: {e}")
+
+    async def receive_commands_from_ui(self) -> AsyncGenerator[Command, None]:
         while True:
             command = await self._command_q.get()
             yield command
+            self._command_q.task_done()
 
-async def sender(events: AsyncGenerator[Event], reader, writer):
-    """Send events to the ui."""
-    del reader
-    async for item in events:
-        logger.debug(f"Sending {item}")
-        writer.write(json.dumps(item).encode() + b"\n")
-        await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+    async def close(self):
+        logger.debug("Closing UI API")
+        if hasattr(self, "_server") and self._server:
+            self._server.close()
+            await self._server.wait_closed()
