@@ -6,24 +6,25 @@ import logging
 import re
 import ssl
 from collections.abc import AsyncGenerator
-from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime
 from functools import cache
 from pathlib import Path
-from tempfile import gettempdir
+from pprint import pp
 from typing import override
 
 import aiohttp
 import importlib_resources
-import keyring
 import truststore
 import websockets
 from async_lru import alru_cache
 
 from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event, create_event
+from kbunified.utils.slack_auth import get_slack_credentials
 
 logger = logging.getLogger("slack_backend")
+
+ua = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
 
 @cache
 def loaded_emojis():
@@ -37,13 +38,15 @@ def get_emoji(code):
     try:
         return emojis[code]
     except KeyError:
-        logger.info(f"Cannot find emoji for {code}")
-        return f":{code}:"
+        return code
 
 def name_of_reaction(em):
+    # Reverse lookup for sending reactions
     x = loaded_emojis()
-    reverse_em = dict(zip(x.values(), x.keys(), strict=False))
-    return reverse_em[em]
+    for name, char in x.items():
+        if char == em:
+            return name
+    return em.replace(":", "")
 
 
 emoji_pattern = re.compile(r":([a-zA-Z0-9_\-+]+):")
@@ -51,16 +54,22 @@ emoji_pattern = re.compile(r":([a-zA-Z0-9_\-+]+):")
 
 def replace_emoji(match):
     code = match.group(1)
-    return get_emoji(code)  # get_emoji looks up the emoji from your loaded_emojis
+    return get_emoji(code)
 
 
 def replace_emojis_in_text(text):
+    if not text: return ""
     return emoji_pattern.sub(replace_emoji, text)
 
 
 mention_pattern = re.compile(r"<@([A-Z0-9]+)>")
-
 post_mention_pattern = re.compile(r"@([\w]+(?:\s+[\w]+)*)")
+
+def _get_attachment_path(file_id, file_name):
+    base = Path.home() / ".cache" / "kb-solaria" / "attachments"
+    base.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(c for c in file_name if c.isalnum() or c in "._- ")
+    return base / f"{file_id}_{safe_name}"
 
 
 class SlackBackend(ChatBackend):
@@ -74,37 +83,41 @@ class SlackBackend(ChatBackend):
         self._inbox = asyncio.Queue()
         self._running = True
         self._ws = None
-        self._current_thread_id = None
+        self._user_id = None
         self.ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        # Retrieve the stored user token from the keyring
-        self._session_token = keyring.get_password("kbunified-slack", "session_token")
-        if not self._session_token:
-            raise RuntimeError("No Slack token found.")
-
-        self._session_cookie = keyring.get_password("kbunified-slack", "session_cookie")
-        if not self._session_cookie:
-            raise RuntimeError("No Slack cookie found.")
-        extra_args = ""
-        self._ws_url = f"wss://wss-primary.slack.com/?token={self._session_token}{extra_args}"
-
         self._session = aiohttp.ClientSession()
+
+        # Caches
         self._message_cache = dict()
         self._user_id_name = dict()
         self._user_name_id = dict()
         self._users = dict()
+
+        # Credentials
+        logger.info("Credentials missing from keyring. Attempting auto-extraction from Firefox...")
+        token, d_cookie, _ = get_slack_credentials() # Ignore ds_cookie
+
+        if token and d_cookie:
+            logger.info("Extraction successful! Saving to keyring.")
+            self._session_token = token
+            self._session_cookie = d_cookie
+        else:
+            logger.error("Auto-extraction failed.")
+            raise RuntimeError("No Slack token/cookie found.")
+
+        # WebSocket URL does require token in query usually
+        self._ws_url = f"wss://wss-primary.slack.com/?token={self._session_token}"
 
     async def is_logged_in(self):
         """Return logged-in status."""
         return self._logged_in
 
     async def connect_ws(self):
-        ua_firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
-        ua_chrome = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         headers = {
-                    "Origin": "https://app.slack.com",
-                    "User-Agent": ua_firefox,
-                    # "Cookie": f"d={self._session_cookie}"
-                }
+            "Origin": "https://app.slack.com",
+            "User-Agent": ua,
+            "Cookie": f"d={self._session_cookie}"
+        }
 
         logger.debug("Connecting to Slack WebSocket")
         self._ws = await websockets.connect(self._ws_url, additional_headers=headers, ssl=self.ssl_ctx)
@@ -113,93 +126,148 @@ class SlackBackend(ChatBackend):
 
     def get_headers(self) -> dict[str, str]:
         """Get the headers for the requests."""
-        return {"Cookie": f"d={self._session_cookie}",
-                "Authorization": f"Bearer {self._session_token}"}
+        return {
+            "Cookie": f"d={self._session_cookie}",
+            "Authorization": f"Bearer {self._session_token}",
+            "User-Agent": ua,
+            "Origin": "https://app.slack.com"
+        }
 
     async def login(self):
         """Log in and verify credentials asynchronously."""
         try:
-            data = await self._get("auth.test")
+            data = await self._post("auth.test")
             self._logged_in = True
+            self._user_id = data["user_id"]
             self._login_event.set()
             logger.debug(f"Logged in to Slack as {data['user']} ({data['user_id']})")
         except:
             logger.exception("login failed")
 
-    async def _get(self, method, **params):
-        """Send a get request to Slack."""
-        logger.debug(f"Getting {method} with params {params}")
-        async with self._session.get(
-            f"https://api.slack.com/api/{method}",
+    async def _request(self, method, endpoint, **kwargs):
+        """Unified request wrapper."""
+        url = f"https://slack.com/api/{endpoint}"
+        logger.debug(f"Req: {method} {endpoint} | Data: {kwargs.get('json', '')}")
+
+        async with self._session.request(
+            method,
+            url,
             headers=self.get_headers(),
             ssl=self.ssl_ctx,
-            params=params
+            **kwargs
         ) as response:
-            data = await response.json()
-            if not data.get("ok", False):
-                logger.error(f"Failed {method}: {data.get('error', 'unknown error')}")
-                raise IOError(f"Failed {method}: {data.get('error', 'unknown error')}")
-            else:
-                return data
+            try:
+                data = await response.json()
+            except:
+                data = {}
 
-    async def _post(self, method, **params):
-        """Send a post request to Slack."""
-        logger.debug(f"Posting {method} with params {params}")
-        async with self._session.post(
-            f"https://api.slack.com/api/{method}",
-            headers=self.get_headers(),
-            ssl=self.ssl_ctx,
-            json=params
-        ) as response:
-            data = await response.json()
             if not data.get("ok", False):
-                logger.error(f"Failed {method}: {data.get('error', 'unknown error')}")
-                raise IOError(f"Failed {method}: {data.get('error', 'unknown error')}")
-            else:
-                return data
+                error = data.get("error", "unknown")
+                logger.error(f"Failed {endpoint}: {error}")
+                raise IOError(f"Slack API Error: {error}")
+            return data
 
-    async def post_message(self, channel_id, message_text, thread_id=None):
-        """Post a message to a Slack channel."""
+    async def _get(self, endpoint, **params):
+        return await self._request("GET", endpoint, params=params)
+
+    async def _post(self, endpoint, **json_body):
+        return await self._request("POST", endpoint, json=json_body)
+
+    # --- ATTACHMENTS ---
+
+    async def _download_file(self, url, path):
+        try:
+            async with self._session.get(url, ssl=self.ssl_ctx, headers=self.get_headers()) as resp:
+                if resp.status == 200:
+                    with path.open("wb") as fd:
+                        fd.write(await resp.read())
+                    logger.debug(f"Downloaded {path}")
+        except Exception:
+            logger.exception(f"Failed to download file to {path}")
+
+    # --- ACTIONS ---
+
+    @override
+    async def post_message(self, channel_id: ChannelID, message_text: str):
         modified_body = self.replace_usernames_with_id(message_text)
-        if thread_id:
-            data = await self._post("chat.postMessage", channel=channel_id, text=modified_body, thread_ts=thread_id)
-        else:
-            data = await self._post("chat.postMessage", channel=channel_id, text=modified_body)
-        return data
+        return await self._post("chat.postMessage", channel=channel_id, text=modified_body)
 
+    @override
     async def post_reply(self, channel_id, thread_id, message_text):
-        """Post a message to a Slack channel."""
-        return await self.post_message(channel_id, message_text, thread_id)
+        modified_body = self.replace_usernames_with_id(message_text)
+        return await self._post("chat.postMessage", channel=channel_id, text=modified_body, thread_ts=thread_id)
 
+    @override
+    async def update_message(self, channel_id: ChannelID, message_id: str, new_text: str):
+        # NEW!!!
+        modified_body = self.replace_usernames_with_id(new_text)
+        await self._post("chat.update", channel=channel_id, ts=message_id, text=modified_body)
+
+    @override
+    async def delete_message(self, channel_id: ChannelID, message_id: str):
+        # NEW!!!
+        await self._post("chat.delete", channel=channel_id, ts=message_id)
+
+    @override
     async def send_reaction(self, channel_id, message_id, reaction):
-        """Send a reaction to a Slack channel."""
         try:
             name = name_of_reaction(reaction)
         except KeyError:
-            logger.error(f"Cannot find reaction name: {reaction}")
+            logger.error(f"'{reaction}' unknown")
             return
-        data = await self._post("reactions.add", channel=channel_id, timestamp=message_id, name=name)
-        return data
+        await self._post("reactions.add", channel=channel_id, timestamp=message_id, name=name)
+
+    @override
+    async def remove_reaction(self, channel_id, message_id, reaction):
+        # NEW!!!
+        try:
+            name = name_of_reaction(reaction)
+        except KeyError:
+            logger.error(f"'{reaction}' unknown")
+            return
+        await self._post("reactions.remove", channel=channel_id, timestamp=message_id, name=name)
+
+    @override
+    async def get_channel_members(self, channel_id: ChannelID) -> list[dict]:
+        # NEW!!!
+        try:
+            data = await self._get("conversations.members", channel=channel_id, limit=200)
+            member_ids = data.get("members", [])
+
+            results = []
+            for uid in member_ids:
+                if uid in self._users:
+                    u = self._users[uid]
+                    results.append({
+                        "id": u["id"],
+                        "name": username(u),
+                        "color": "#" + u.get("color", "cccccc")
+                    })
+            return results
+        except Exception:
+            logger.exception(f"Failed to fetch members for {channel_id}")
+            return []
+
+    # --- HELPERS ---
 
     def replace_usernames_with_id(self, text: str) -> str:
-        """Replace mentions of known users with the corresponding slack id."""
         return post_mention_pattern.sub(self._replace_mention_with_id, text)
 
     def _replace_mention_with_id(self, match: re.Match) -> str:
         mention_text = match.group(1)
         user_id = self._user_name_id.get(mention_text)
-        if user_id:
-            return f"<@{user_id}>"
-        else:
-            return match.group(0)
+        return f"<@{user_id}>" if user_id else match.group(0)
 
+    # --- DATA FETCHING ---
+
+    @override
     async def get_subbed_channels(self):
-        """Get the list of Slack channels the user is in."""
         channels = []
         try:
             data = await self._post("client.userBoot", _x_reason="initial_data", version_all_channels=False,
                                     omit_channels=False, include_min_version_bumf_check=1,
                                     _x_app_name="client")
+
             counts = await self._post("client.counts")
             metadata = {count["id"]: count for count in counts["channels"] + counts["ims"]}
 
@@ -208,76 +276,105 @@ class SlackBackend(ChatBackend):
                     continue
 
                 channel_id = channel["id"]
-                unread = metadata.get(channel_id, dict()).get("has_unreads", False)
-                mentions = metadata.get(channel_id, dict()).get("mention_count", 0)
-                starred = channel_id in data.get("starred", list())
+                meta = metadata.get(channel_id, {})
+                name = channel["name"]
+                # beautify mpdm names
+                if channel.get("is_mpim"):
+                    members = []
+                    for member in channel["members"]:
+                        user = await self.fetch_user(member)
+                        members.append(username(user))
+                    name = ", ".join(members)
 
                 chan = Channel(id=channel_id,
-                               name=channel["name"],
+                               name=name,
                                topic=channel["topic"]["value"],
-                               unread=unread,
-                               mentions=mentions,
-                               starred=starred)
-                logger.debug(f"added {chan}")
+                               unread=meta.get("has_unreads", False),
+                               mentions=meta.get("mention_count", 0),
+                               starred=channel_id in data.get("starred", []))
                 channels.append(chan)
+                logger.debug(f"Added {chan}")
+
             for im in data["ims"]:
-                if im["is_archived"]:
-                    continue
+                if im["is_archived"]: continue
+
                 try:
-                    user_name = username(self._users[im["user"]])
+                    target_user = self._users[im["user"]]
+                    user_name = username(target_user)
                 except KeyError:
                     continue
+
                 channel_id = im["id"]
-                unread = metadata.get(channel_id, dict()).get("has_unreads", False)
-                mentions = metadata.get(channel_id, dict()).get("mention_count", 0)
-                starred = channel_id in data.get("starred", list())
+                meta = metadata.get(channel_id, {})
 
                 chan = Channel(id=channel_id,
                                name=user_name,
                                topic=f"Conversation with {user_name}",
-                               unread=unread,
-                               mentions=mentions,
-                               starred=starred)
-                logger.debug(f"added im {chan}")
+                               unread=meta.get("has_unreads", False),
+                               mentions=meta.get("mention_count", 0),
+                               starred=channel_id in data.get("starred", []))
                 channels.append(chan)
+                logger.debug(f"Added {chan}")
+
             return channels
         except:
             logger.exception("building channel list failed")
             raise
 
+    # --- EVENTS & MAIN LOOP ---
+
     def create_event(self, event, **fields) -> Event:
-        """Create an event from this service."""
         return create_event(event=event,
                             service=dict(name=self.name, id=self._service_id),
                             **fields)
 
-    # @overload
     async def events(self) -> AsyncGenerator[Event]:
-        """Event generator (polling for new messages)."""
         await self._login_event.wait()
-        logger.debug("Slack backend ready to roll")
-
         await self.connect_ws()
-
-        # Fetch users and channels
+        # 1. Fetch Users
         await self.fetch_all_users()
+
+        # 2. HANDSHAKE
+        myself = self._users.get(self._user_id)
+        if myself:
+            yield self.create_event(
+                event="self_info",
+                user={
+                    "id": self._user_id,
+                    "name": username(myself),
+                    "color": "#" + myself.get("color", "cccccc")
+                }
+            )
+
+        # 3. Channels
         channels = await self.get_subbed_channels()
+        yield self.create_event(event="channel_list",
+                                channels=[asdict(chan) for chan in channels])
 
-        channel_list = self.create_event(event="channel_list",
-                                         channels=[asdict(chan) for chan in channels])
-        yield channel_list
+        user_list = []
+        for u in self._users.values():
+            if u.get("deleted"):
+                continue
 
+            user_list.append({
+                "id": u["id"],
+                "name": username(u),
+                "color": "#" + u.get("color", "cccccc")
+            })
+
+        yield self.create_event(event="user_list", users=user_list)
+
+        # 4. Loop
         async def over_ws():
             async for event in self._ws:
                 await self._inbox.put(event)
+
         ws_task = asyncio.create_task(over_ws())
         try:
             while self._running:
                 message = await self._inbox.get()
-                # Process each incoming message
                 try:
                     data = json.loads(message)
-                    logger.debug(f"Received data: {data}")
                     event = await self.handle_event(data)
                     if event:
                         yield event
@@ -287,166 +384,199 @@ class SlackBackend(ChatBackend):
             ws_task.cancel()
 
     async def handle_event(self, json_data) -> Event | None:
-        """Handle data dictionary to form events."""
-        if json_data["type"] == "message":
-            if json_data.get("subtype") == "message_replied":
-                json_data["message"]["channel"] = json_data["channel"]
-                return await self.handle_event(json_data["message"])
-            elif json_data.get("subtype") == "message_deleted":
-                return self.message_deleted(json_data)
-            elif json_data.get("subtype") == "message_changed":
-                json_data["message"]["channel"] = json_data["channel"]
-                return await self.handle_event(json_data["message"])
-            elif json_data.get("subtype"):
-                logger.debug(f"Ignoring (unknown subtype): {json_data}")
-                return
-            user = json_data["user"]
-            asyncio.create_task(self.fetch_user(user))
-            return await self.create_message_from_blob(json_data)
-        if json_data["type"] == "reaction_added":
-            return self.react_to_message(json_data)
-        if json_data["type"] == "reaction_removed":
-            return self.unreact_to_message(json_data)
+        etype = json_data["type"]
+
+        if etype == "message":
+            logger.debug(pp(json_data))
+            subtype = json_data.get("subtype")
+
+            if subtype == "message_changed":
+                new_json = json_data["message"]
+                new_json["channel"] = json_data["channel"]
+                body = replace_emojis_in_text(new_json["text"])
+                body = await self.replace_mentions_in_text(body)
+
+                return self.create_event(
+                    event="message_update",
+                    message={"id": new_json["ts"], "body": body}
+                )
+
+            elif subtype == "message_deleted":
+                return self.create_event(
+                    event="message_delete",
+                    channel_id=json_data["channel"],
+                    message_id=json_data["deleted_ts"]
+                )
+
+            elif subtype == "message_replied":
+                new_json = json_data["message"]
+                new_json["channel"] = json_data["channel"]
+                return await self.create_message_event_from_json(new_json)
+            elif not subtype:
+                asyncio.create_task(self.fetch_user(json_data["user"]))
+                return await self.create_message_event_from_json(json_data)
+
+        elif etype in ["reaction_added", "reaction_removed"]:
+            item = json_data["item"]
+            if item["type"] != "message": return None
+
+            return self.create_event(
+                event="message_reaction",
+                action="add" if etype == "reaction_added" else "remove",
+                message_id=item["ts"],
+                channel_id=item["channel"],
+                emoji=get_emoji(json_data["reaction"]),
+                user_id=json_data["user"]
+            )
+
+        return None
 
     def register_user(self, user_info):
-        user_id = user_info["id"]
-        display_name = username(user_info)
-        self._user_id_name[user_id] = display_name
-        self._user_name_id[display_name] = user_id
-        self._users[user_id] = user_info
+        uid = user_info["id"]
+        dname = username(user_info)
+        self._user_id_name[uid] = dname
+        self._user_name_id[dname] = uid
+        self._users[uid] = user_info
 
     async def fetch_all_users(self):
         if not self._users:
-            data = await self._get("users.list")
-            for user in data["members"]:
-                self.register_user(user)
+            cursor = None
+            while True:
+                params = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+
+                try:
+                    data = await self._get("users.list", **params)
+                    members = data.get("members", [])
+
+                    for user in members:
+                        self.register_user(user)
+
+                    # Check for next page
+                    cursor = data.get("response_metadata", {}).get("next_cursor")
+                    if not cursor:
+                        break
+
+                except Exception:
+                    logger.exception("Failed to fetch user page")
+                    break
 
     async def fetch_user(self, user_id):
+        if user_id not in self._users:
+            data = await self._get("users.info", user=user_id)
+            self.register_user(data["user"])
         return self._users[user_id]
 
     @alru_cache
-    async def switch_channel(self, channel_id, limit=20):
-        """Switch channel."""
-        view = await self._post("conversations.view", channel=channel_id, count=limit, ignore_replies=True)
-        unread_count = view.get("channel", view.get("group"))["unread_count"]
-        async for message in self.fetch_messages(channel_id, view["history"], unread_count):
-            await self._inbox.put(message)
+    async def switch_channel(self, channel_id, after: str|None = None):
+        """Switch channel with delta sync."""
+        params = {"channel": channel_id, "limit": 50}
 
-    async def fetch_messages(self,  channel_id, data, unread_count):
-        """Poll Slack for new messages asynchronously."""
+        if after:
+            params["oldest"] = after
+
         try:
-            logger.debug(f"Got conversation history for {channel_id}")
-            logger.debug(f"Unread count {unread_count}")
-            message_list = data.get("messages", [])
-            unread_count -= len(message_list)
-            for message in reversed(message_list):
+            data = await self._get("conversations.history", **params)
+            messages = data.get("messages", [])
+
+            # LOGGING: See if we actually got messages
+            logger.debug(f"Switching to {channel_id}: Found {len(messages)} messages")
+
+            for message in reversed(messages):
                 if "channel" not in message:
                     message["channel"] = channel_id
-                unread_count += 1
-                if unread_count > 0:
-                    message["unread"] = True
-                logger.debug(message)
-                yield json.dumps(message)
-        except:
-            logger.exception("Something went wrong fetching history")
+                await self._inbox.put(json.dumps(message))
+
+        except Exception:
+            logger.exception("fetch history failed")
             raise
 
     @alru_cache
-    async def fetch_thread(self, channel_id, thread_id):
+    async def fetch_thread(self, channel_id, thread_id, after: str|None = None):
         async for message in self.fetch_thread_replies(channel_id, thread_id):
             await self._inbox.put(message)
 
-    async def fetch_thread_replies(self,  channel_id, thread_id):
-        """Poll Slack for new replies asynchronously."""
+    async def fetch_thread_replies(self, channel_id, thread_id):
         try:
             data = await self._get("conversations.replies", channel=channel_id, ts=thread_id)
             logger.debug(f"Got thread history for {channel_id}@{thread_id}")
-            for message in reversed(data.get("messages", [])):
-                logger.debug(message)
-                if "channel" not in message:
-                    message["channel"] = channel_id
-                yield json.dumps(message)
+            messages = data.get("messages", [])
+            total_replies = max(0, len(messages) - 1)
+
+            for msg in reversed(messages):
+                logger.debug(msg)
+                msg["channel"] = channel_id
+
+                yield json.dumps(msg)
+
         except:
             logger.exception("Something went wrong fetching thread")
-            raise
 
-    def message_deleted(self, blob):
-        """Issue a message deletion event."""
-        channel_id = blob["channel"]
-        message_id=blob["deleted_ts"]
-
-        event = self.create_event(event="deleted_message",
-                                  channel_id=channel_id,
-                                  message_id=message_id)
-        return event
-
-    async def _download_file(self, attachment, path):
-        resp = await self._session.get(attachment["url_private"],
-                                       ssl=self.ssl_ctx,
-                                       headers=self.get_headers())
-        with path.open("wb") as fd:
-            fd.write(await resp.read())
-
-    async def create_message_from_blob(self, blob):
-        """Convert a Slack message event into a unified message event."""
+    async def create_message_event_from_json(self, blob):
         try:
+            # breakpoint()
             channel_id = blob["channel"]
-            # ts is the id, not msg_client_id
             message_id = blob["ts"]
-            user_info = await self.fetch_user(blob["user"])
-            author = dict(id=user_info["id"], username=user_info["name"],
-                          display_name=username(user_info),
-                          color="#" + user_info["color"])
-            body = replace_emojis_in_text(blob["text"])
+
+            user_id = blob.get("user")
+            if user_id:
+                user_info = await self.fetch_user(user_id)
+                author = dict(id=user_info["id"],
+                              display_name=username(user_info),
+                              color="#" + user_info.get("color", "cccccc"))
+            else:
+                author = dict(id="bot", name=blob.get("username", "Bot"), color="#cccccc")
+
+            text = blob.get("text", "")
+            body = replace_emojis_in_text(text)
             body = await self.replace_mentions_in_text(body)
 
             timestamp = float(blob["ts"])
-            ts_date, ts_time = self.blob_to_time(timestamp)
+            dt = datetime.fromtimestamp(timestamp)
+            timestamp = int(timestamp * 1000)
 
             message = dict(body=body,
                            author=author,
                            id=message_id,
                            timestamp=timestamp,
-                           ts_date=ts_date,
-                           ts_time=ts_time)
+                           ts_date=dt.date().isoformat(),
+                           ts_time=dt.time().isoformat())
 
-            with suppress(KeyError):
+            if "thread_ts" in blob and blob["thread_ts"] != blob["ts"]:
                 message["thread_id"] = blob["thread_ts"]
-            if blob.get("reactions"):
-                message["reactions"] = {get_emoji(reaction["name"]): reaction["users"] for reaction in blob["reactions"]}
-            if blob.get("reply_count", 0) > 0:
-                message["replies"] = dict(count=blob["reply_count"], users=blob["reply_users"])
-            with suppress(KeyError):
-                bfiles = blob["files"]
-                files = list()
-                for attachment in bfiles:
-                    path = Path(gettempdir()) / (attachment["id"] + "_" + attachment["name"].replace(" ", "_"))
-                    if not path.exists():
-                        asyncio.create_task(self._download_file(attachment, path))
 
-                    files.append(f"![{attachment["title"]}]({str(path)})")
-                message["body"] += "\n" + "\n".join(files)
-            with suppress(KeyError):
-                attachments = blob["attachments"]
-                for attachment in attachments:
-                    message["body"] += attachment["pretext"] + "\n"
-                    message["body"] += attachment["title"] + "\n"
-                    message["body"] += await self.replace_mentions_in_text(attachment["text"]) + "\n"
-                    message["body"] += attachment["footer"] + "\n"
-            if "edited" in blob:
-                blob_dt = float(blob["edited"]["ts"])
-                edt = self.blob_to_time(blob_dt)
-                message["edit_date"], message["edit_time"] = edt
-            if "unread" in blob:
+            if "reactions" in blob:
+                reactions = {}
+                for rx in blob["reactions"]:
+                    emoji = get_emoji(rx["name"])
+                    reactions[emoji] = rx["users"]
+                message["reactions"] = reactions
+
+            if blob.get("reply_count", 0) > 0:
+                message["replies"] = dict(count=blob["reply_count"])
+
+            if "files" in blob:
+                attachments = []
+                for f in blob["files"]:
+                    path = _get_attachment_path(f["id"], f["name"])
+                    if not path.exists():
+                        asyncio.create_task(self._download_file(f["url_private"], path))
+                    attachments.append({
+                        "id": f["id"],
+                        "name": f["name"],
+                        "path": str(path)
+                    })
+                message["attachments"] = attachments
+
+            if blob.get("unread"):
                 message["unread"] = True
 
             event = create_event(event="message",
                                  channel_id=channel_id,
                                  service=dict(name=self.name, id=self._service_id),
                                  message=message)
-
-            index = (blob["channel"], blob["ts"])
-            self._message_cache[index] = event
+            # print(event)
             return event
         except:
             logger.exception("decoding message failed")
@@ -455,73 +585,22 @@ class SlackBackend(ChatBackend):
     async def replace_mentions_in_text(self, text):
         body = text
         for match in mention_pattern.finditer(text):
-            user = await self.fetch_user(match.group(1))
-            user_name = user["profile"]["display_name"] or user["profile"]["real_name"]
-            body = body.replace(match.group(0), "@" + user_name)
+            uid = match.group(1)
+            try:
+                user = await self.fetch_user(uid)
+                user_name = username(user)
+                body = body.replace(match.group(0), "@" + user_name)
+            except:
+                pass
         return body
 
-    def react_to_message(self, blob):
-        index = (blob["item"]["channel"], blob["item"]["ts"])
-        event = self._message_cache.get(index)
-        if not event:
-            return None
-        reaction_emoji = get_emoji(blob["reaction"])
-        reactions = event["message"].setdefault("reactions", dict())
-        reaction_users = reactions.setdefault(reaction_emoji, list())
-        reaction_users.append(blob["user"])
-        return event
-
-    def unreact_to_message(self, blob):
-        index = (blob["item"]["channel"], blob["item"]["ts"])
-        event = self._message_cache.get(index)
-        if not event:
-            return None
-        reaction_emoji = get_emoji(blob["reaction"])
-        event["message"]["reactions"][reaction_emoji].remove(blob["user"])
-        if not event["message"]["reactions"][reaction_emoji]:
-            event["message"]["reactions"].pop(reaction_emoji)
-        if not event["message"]["reactions"]:
-            event["message"].pop("reactions")
-        return event
-
+    @override
     async def close(self):
-        """Shut down the backend and close the aiohttp session."""
         self._running = False
         if self._session:
             await self._session.close()
         if self._ws:
-            self._ws.close()
-
-    @staticmethod
-    def blob_to_time(timestamp):
-        """Convert Slack timestamp (epoch format) to a formatted date/time."""
-        dt = datetime.fromtimestamp(timestamp)
-
-        return dt.date().isoformat(), dt.time().isoformat()
-
-    @override
-    async def delete_message(self, channel_id: ChannelID, message_id: str):
-        return await super().delete_message(channel_id, message_id)
-
-    async def mark_channel_read(self, channel_id, message_id):
-        """Mark a Slack channel as read."""
-        data = await self._post("conversations.mark", channel=channel_id, ts=message_id)
-        return data
+            await self._ws.close()
 
 def username(user_info):
-    return user_info["profile"]["display_name"] or user_info.get("real_name")
-
-
-
-"""
-todo
-- display name
-- signal new message in inactive channels
-- reconnect url
-- typing detection
-
-
-some test messages
-
-"""
-
+    return user_info["profile"].get("display_name") or user_info.get("real_name") or user_info.get("name")

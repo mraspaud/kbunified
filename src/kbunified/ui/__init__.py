@@ -29,6 +29,7 @@ class UIAPI:
 
         self._channel_lists = []
         self._handshakes = []
+        self._user_lists = []
 
     async def _websocket_handler(self, websocket, path=None):
         """Handles a single WebSocket connection.
@@ -40,6 +41,8 @@ class UIAPI:
             await websocket.send(handshake)
         for chlist in self._channel_lists:
             await websocket.send(chlist)
+        for ulist in self._user_lists:
+            await websocket.send(ulist)
 
         try:
             async for message in websocket:
@@ -85,6 +88,9 @@ class UIAPI:
                 elif isinstance(data, dict) and data.get("event") == "channel_list":
                     self._channel_lists.append(payload)
                     logger.debug("Cached channel list")
+                elif isinstance(data, dict) and data.get("event") == "user_list":
+                    self._user_lists.append(payload)
+                    logger.debug("Cached user list")
 
                 # 3. Broadcast (if anyone is home)
                 if self.connected_clients:

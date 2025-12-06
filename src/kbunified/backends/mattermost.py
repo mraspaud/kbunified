@@ -133,6 +133,35 @@ class MattermostBackend(ChatBackend):
             logger.exception("error in fetching channels")
         return channels
 
+    async def fetch_all_users(self):
+        """Fetch all users from Mattermost with pagination."""
+        page = 0
+        per_page = 200  # Mattermost max per_page is usually 200
+        logger.debug(f"Fetching all users from {self.name}...")
+
+        while True:
+            try:
+                # Fetch a page of users
+                users = await self._get("users", page=page, per_page=per_page, active="true")
+
+                if not users:
+                    break
+
+                # Store them in the internal cache
+                for u in users:
+                    self._users[u["id"]] = u
+
+                logger.debug(f"Fetched page {page} ({len(users)} users)")
+
+                # If we got less than the limit, we've reached the end
+                if len(users) < per_page:
+                    break
+
+                page += 1
+            except Exception:
+                logger.exception("Failed to fetch users page")
+                break
+
     async def _download_file(self, file_id, path):
         """Download a file from Mattermost."""
         url = f"{self._api_domain}/api/v4/files/{file_id}"
@@ -225,6 +254,18 @@ class MattermostBackend(ChatBackend):
         channel_list = self.create_event(event="channel_list",
                                          channels=[asdict(chan) for chan in channels])
         yield channel_list
+
+        await self.fetch_all_users()
+
+        user_list = []
+        for u in self._users.values():
+            user_list.append({
+                "id": u["id"],
+                "name": self._create_display_name(u),
+                "color": str_to_color(u["id"])
+            })
+
+        yield self.create_event(event="user_list", users=user_list)
 
         async def over_ws():
             async for event in self._ws:
@@ -386,6 +427,10 @@ class MattermostBackend(ChatBackend):
         event = self.create_event(event="message",
                                   channel_id=post["channel_id"],
                                   message=message)
+#         print(event)
+#         breakpoint()
+# {'event': 'message', 'service': {'name': 'Pytroll', 'id': 'pytroll_slack'}, 'channel_id': 'C06GJDYPJ', 'message': {'body': 'good morning!', 'author': {'id': 'U06GJFRMJ', 'name': 'martin', 'color': '#9f69e7'}, 'id': '1764054914.587079', 'timestamp': 1764054914.587079, 'ts_date': '2025-11-25', 'ts_time': '08:15:14.587079'}}
+# {'event': 'message', 'service': {'name': 'SMHI', 'id': 'smhi_mattermost'}, 'channel_id': 'nre6hfkosjds5ehh6ri1yudn4r', 'message': {'body': 'a001673 joined the channel.', 'author': {'id': 'zbwhwzzmei8k5poscxxfh7sfpa', 'display_name': 'Martin Raspaud', 'color': '#6fb259'}, 'id': 'a4ictnwod3r8fdhj57my7gbt1c', 'timestamp': 1741359909934, 'ts_date': '2025-03-07', 'ts_time': '16:05:09.934000'}}
         return event
 
     @override
