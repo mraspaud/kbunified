@@ -77,6 +77,10 @@ class ChatBackend(ABC):
     async def remove_reaction(self, channel_id: ChannelID, message_id: str, reaction: str):
         """Remove a reaction."""
 
+    async def set_typing_status(self, channel_id: ChannelID):
+        """Indicate that the user is typing in the channel."""
+        pass
+
     async def fetch_thread(self, channel_id: ChannelID, thread_id: str, after: str|None = None):
         """Fetch messages from a thread."""
         del channel_id, thread_id

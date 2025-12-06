@@ -141,6 +141,16 @@ async def main(args=None):
                     elif action == "remove":
                         if hasattr(service, "remove_reaction"):
                             await service.remove_reaction(cmd["channel_id"], cmd["message_id"], emoji)
+                elif cmd["command"] == "mark_read":
+                    logger.debug(f"Marking read in {cmd['service_id']}")
+                    if hasattr(service, "mark_channel_read"):
+                        # Some backends (Slack) need the timestamp (message_id) to mark 'up to here'
+                        await service.mark_channel_read(cmd["channel_id"], cmd["message_id"])
+
+                elif cmd["command"] == "typing":
+                    # We don't log this to debug by default to avoid spam
+                    if hasattr(service, "set_typing_status"):
+                        await service.set_typing_status(cmd["channel_id"])
             except Exception as e:
                 logger.error(f"Error processing command {cmd.get('command')}: {e}")
     except Exception:

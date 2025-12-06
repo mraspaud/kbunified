@@ -540,6 +540,21 @@ class MattermostBackend(ChatBackend):
         return data
 
     @override
+    async def set_typing_status(self, channel_id: ChannelID):
+        """Send a typing event via WebSocket."""
+        # Mattermost expects typing events over the websocket to show up instantly
+        if self._ws:
+            payload = {
+                "action": "user_typing",
+                "seq": 1,
+                "data": {
+                    "channel_id": channel_id,
+                    "parent_id": "" # Add thread_id support here later if needed
+                }
+            }
+            await self._ws.send(json.dumps(payload))
+
+    @override
     async def close(self):
         """Close the backend."""
         self._running = False

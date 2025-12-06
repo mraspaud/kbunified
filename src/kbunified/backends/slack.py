@@ -227,6 +227,16 @@ class SlackBackend(ChatBackend):
             return
         await self._post("reactions.remove", channel=channel_id, timestamp=message_id, name=name)
 
+
+    async def mark_channel_read(self, channel_id, message_id):
+        """Mark a Slack channel as read."""
+        await self._post("conversations.mark", channel=channel_id, ts=message_id)
+
+    @override
+    async def set_typing_status(self, channel_id: ChannelID):
+        # Slack HTTP API does not support sending typing indicators easily.
+        pass
+
     @override
     async def get_channel_members(self, channel_id: ChannelID) -> list[dict]:
         # NEW!!!
