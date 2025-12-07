@@ -287,6 +287,7 @@ class SlackBackend(ChatBackend):
 
                 channel_id = channel["id"]
                 meta = metadata.get(channel_id, {})
+                last_read = float(meta.get("last_read", 0))
                 name = channel["name"]
                 # beautify mpdm names
                 if channel.get("is_mpim"):
@@ -301,7 +302,8 @@ class SlackBackend(ChatBackend):
                                topic=channel["topic"]["value"],
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
-                               starred=channel_id in data.get("starred", []))
+                               starred=channel_id in data.get("starred", []),
+                               last_read_at=last_read)
                 channels.append(chan)
                 logger.debug(f"Added {chan}")
 

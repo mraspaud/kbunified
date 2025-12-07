@@ -122,11 +122,15 @@ class MattermostBackend(ChatBackend):
             for chan in data:
                 channel_id = chan["id"]
                 udata = await self._get(f"users/{self._user_id}/channels/{channel_id}/unread")
+                # FIXME: optimise this
+                member = await self._get(f"channels/{channel_id}/members/me")
+                last_viewed = member.get("last_viewed_at", 0) / 1000.0 # Convert ms to s
                 channel = Channel(id=channel_id,
                                   name=chan["display_name"] or chan["name"],
                                   topic=chan["purpose"],
                                   unread=bool(udata["msg_count"]),
-                                  mentions=udata["mention_count"]
+                                  mentions=udata["mention_count"],
+                                  last_read_at=last_viewed
                                   )
                 channels.append(channel)
         except:
