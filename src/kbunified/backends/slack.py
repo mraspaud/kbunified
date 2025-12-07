@@ -280,6 +280,7 @@ class SlackBackend(ChatBackend):
 
             counts = await self._post("client.counts")
             metadata = {count["id"]: count for count in counts["channels"] + counts["ims"]}
+            total_pop = len(self._users) if self._users else 1
 
             for channel in data["channels"]:
                 if channel["is_archived"]:
@@ -297,13 +298,22 @@ class SlackBackend(ChatBackend):
                         members.append(username(user))
                     name = ", ".join(members)
 
+                last_post = 0.0
+                latest = channel.get("latest") # Message object
+                if latest and "ts" in latest:
+                    last_post = float(latest["ts"])
+
+                mass = channel.get("num_members", 1) / total_pop
                 chan = Channel(id=channel_id,
                                name=name,
                                topic=channel["topic"]["value"],
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
                                starred=channel_id in data.get("starred", []),
-                               last_read_at=last_read)
+                               last_read_at=last_read,
+                               last_post_at=last_post,
+                               mass=mass,
+                               )
                 channels.append(chan)
                 logger.debug(f"Added {chan}")
 
@@ -324,7 +334,9 @@ class SlackBackend(ChatBackend):
                                topic=f"Conversation with {user_name}",
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
-                               starred=channel_id in data.get("starred", []))
+                               starred=channel_id in data.get("starred", []),
+                               mass=1/total_pop
+                               )
                 channels.append(chan)
                 logger.debug(f"Added {chan}")
 
@@ -528,7 +540,6 @@ class SlackBackend(ChatBackend):
 
     async def create_message_event_from_json(self, blob):
         try:
-            # breakpoint()
             channel_id = blob["channel"]
             message_id = blob["ts"]
 

@@ -18,6 +18,8 @@ class Channel:
     mentions: int = 0
     starred: bool = False
     last_read_at: float = 0.0
+    last_post_at: float = 0.0
+    mass: float = 1
 
 class ChatBackend(ABC):
     """Chat backend."""

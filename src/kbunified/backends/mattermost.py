@@ -115,24 +115,68 @@ class MattermostBackend(ChatBackend):
 
     @override
     async def get_subbed_channels(self) -> list[Channel]:
-        """Get channels the user is subbed to."""
+        """Get channels with optimized bulk fetching."""
         channels = []
         try:
-            data = await self._get(f"users/{self._user_id}/teams/{self._team_id}/channels")
-            for chan in data:
+            # 1. Fetch ALL Channel Metadata (Global info: Name, ID, Last Post)
+            # This returns the definitions of the channels.
+            all_channels = await self._get(f"users/{self._user_id}/teams/{self._team_id}/channels")
+            total_pop = len(self._users) if self._users else 1
+
+            # 2. Fetch ALL User Membership Data (Local info: Unreads, Last View)
+            # This ONE call replaces the N loop calls for unread/members.
+            # Endpoint: /users/{user_id}/teams/{team_id}/channels/members
+            memberships_data = await self._get(f"users/{self._user_id}/teams/{self._team_id}/channels/members")
+
+            # Create a lookup map: channel_id -> membership_info
+            my_membership = {m["channel_id"]: m for m in memberships_data}
+
+            for chan in all_channels:
                 channel_id = chan["id"]
-                udata = await self._get(f"users/{self._user_id}/channels/{channel_id}/unread")
-                # FIXME: optimise this
-                member = await self._get(f"channels/{channel_id}/members/me")
-                last_viewed = member.get("last_viewed_at", 0) / 1000.0 # Convert ms to s
+
+                # --- STATS FETCH (The new cost) ---
+                # We need this to get the real member count.
+                # It is still N+1, but we removed N*2 other calls, so it's a net win.
+                try:
+                    stats = await self._get(f"channels/{channel_id}/stats")
+                    member_count = stats.get("member_count", 1)
+                except:
+                    member_count = 1
+                # ----------------------------------
+
+                # Lookup my specific state from the bulk map
+                my_data = my_membership.get(channel_id, {})
+
+                # Extract timestamps
+                last_viewed = my_data.get("last_viewed_at", 0) / 1000.0
+                last_post = chan.get("last_post_at", 0) / 1000.0
+
+                # --- NAME RESOLUTION ---
+                display_name = chan["display_name"] or chan["name"]
+                if chan["type"] == "D":
+                    ids = chan["name"].split("__")
+                    other_id = next((i for i in ids if i != self._user_id), None)
+                    if other_id:
+                        other_user = self._users.get(other_id)
+                        if other_user:
+                            display_name = self._create_display_name(other_user)
+
+                # --- MASS CALCULATION ---
+                # Consistency: Match Slack's logic (Members * 50)
+                mass = member_count / total_pop
+                # ------------------------
+
                 channel = Channel(id=channel_id,
-                                  name=chan["display_name"] or chan["name"],
+                                  name=display_name,
                                   topic=chan["purpose"],
-                                  unread=bool(udata["msg_count"]),
-                                  mentions=udata["mention_count"],
-                                  last_read_at=last_viewed
-                                  )
+                                  unread=bool(my_data.get("msg_count", 0)),
+                                  mentions=my_data.get("mention_count", 0),
+                                  last_read_at=last_viewed,
+                                  last_post_at=last_post,
+                                  mass=mass)
+
                 channels.append(channel)
+
         except:
             logger.exception("error in fetching channels")
         return channels
@@ -254,12 +298,6 @@ class MattermostBackend(ChatBackend):
             channel_prefix="~"
         )
 
-        # 3. Then send channels
-        channels = await self.get_subbed_channels()
-        channel_list = self.create_event(event="channel_list",
-                                         channels=[asdict(chan) for chan in channels])
-        yield channel_list
-
         await self.fetch_all_users()
 
         user_list = []
@@ -271,6 +309,12 @@ class MattermostBackend(ChatBackend):
             })
 
         yield self.create_event(event="user_list", users=user_list)
+
+        # 3. Then send channels
+        channels = await self.get_subbed_channels()
+        channel_list = self.create_event(event="channel_list",
+                                         channels=[asdict(chan) for chan in channels])
+        yield channel_list
 
         async def over_ws():
             async for event in self._ws:
