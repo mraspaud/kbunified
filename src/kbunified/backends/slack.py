@@ -355,7 +355,8 @@ class SlackBackend(ChatBackend):
                     "id": self._user_id,
                     "name": username(myself),
                     "color": "#" + myself.get("color", "cccccc")
-                }
+                },
+            channel_prefix="#"
             )
 
         # 3. Channels

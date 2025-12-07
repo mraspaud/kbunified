@@ -250,7 +250,8 @@ class MattermostBackend(ChatBackend):
                 "id": self._user_id,
                 "name": my_name,
                 "color": str_to_color(self._user_id)
-            }
+            },
+            channel_prefix="~"
         )
 
         # 3. Then send channels
