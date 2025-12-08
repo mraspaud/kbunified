@@ -17,7 +17,7 @@ from typing import override
 import aiohttp
 import browser_cookie3
 import truststore
-import websockets
+from aiohttp import WSMsgType
 from async_lru import alru_cache
 from requests.utils import dict_from_cookiejar
 
@@ -284,7 +284,6 @@ class MattermostBackend(ChatBackend):
         """Yield real-time events."""
         await self._login_event.wait()
         await self.connect_ws()
-
         # Calculate display name using the existing helper
         my_name = self._create_display_name(self._myself)
 
@@ -317,9 +316,19 @@ class MattermostBackend(ChatBackend):
         yield channel_list
 
         async def over_ws():
-            async for event in self._ws:
-                logger.debug(f"Received data: {event}")
-                await self._inbox.put(event)
+            try:
+                async for msg in self._ws:
+                    if msg.type == WSMsgType.TEXT:
+                        await self._inbox.put(msg.data)
+                    elif msg.type == WSMsgType.ERROR:
+                        logger.error(f"WS Error: {msg.data}")
+                        break
+                    elif msg.type == WSMsgType.CLOSED:
+                        logger.debug("WS Closed")
+                        break
+            except Exception:
+                logger.exception("Error in WS loop")
+
         ws_task = asyncio.create_task(over_ws())
         try:
             while self._running:
@@ -340,18 +349,29 @@ class MattermostBackend(ChatBackend):
 
     async def connect_ws(self):
         headers = {
-                    "Origin": self._api_domain,
-                    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                   "Chrome/132.0.0.0 Safari/537.36"),
-                    "Cookie": ";".join(key+"="+val for key, val in self._dict_cookies.items())
-                }
-        logger.debug("Connecting to Mattermost WebSocket")
+            "Origin": self._api_domain,
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/132.0.0.0 Safari/537.36"),
+        }
+
+        # Add cookies manually to headers if needed, though session usually handles it
+        cookie_header = ";".join(key+"="+val for key, val in self._dict_cookies.items())
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        logger.debug("Connecting to Mattermost WebSocket (AIOHTTP)")
 
         self.ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        self._ws = await websockets.connect("wss://" + self._domain + "/api/v4/websocket",
-                                            additional_headers=headers,
-                                            ssl=self.ssl_ctx)
+
+        # KEY CHANGE: Use session.ws_connect
+        # This respects HTTP_PROXY/NO_PROXY automatically!
+        self._ws = await self._session.ws_connect(
+            "wss://" + self._domain + "/api/v4/websocket",
+            headers=headers,
+            ssl=self.ssl_ctx,
+            heartbeat=30 # Keepalive
+        )
         return self._ws
 
     def handle_event(self, event):
