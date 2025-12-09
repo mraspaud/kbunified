@@ -17,7 +17,6 @@ import aiohttp
 import importlib_resources
 import truststore
 import websockets
-from async_lru import alru_cache
 
 from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event, create_event
 from kbunified.utils.slack_auth import get_slack_credentials
@@ -493,7 +492,6 @@ class SlackBackend(ChatBackend):
             self.register_user(data["user"])
         return self._users[user_id]
 
-    @alru_cache
     async def switch_channel(self, channel_id, after: str|None = None):
         """Switch channel with delta sync."""
         params = {"channel": channel_id, "limit": 50}
@@ -517,7 +515,6 @@ class SlackBackend(ChatBackend):
             logger.exception("fetch history failed")
             raise
 
-    @alru_cache
     async def fetch_thread(self, channel_id, thread_id, after: str|None = None):
         async for message in self.fetch_thread_replies(channel_id, thread_id):
             await self._inbox.put(message)

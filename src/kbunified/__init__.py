@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
@@ -93,6 +94,49 @@ async def main(args=None):
         # 3. This loop keeps the main program alive while processing commands
         async for cmd in ui_api.receive_commands_from_ui():
             try:
+                if cmd["command"] == "open_path":
+                    path = cmd["path"]
+                    logger.debug(f"Opening path: {path}")
+                    try:
+                        # Use shutil to check if the tool exists before calling
+                        import shutil
+                        opener = None
+                        if sys.platform == "win32":
+                            os.startfile(path)
+                        elif sys.platform == "darwin":
+                            opener = "open"
+                        else:
+                            opener = "xdg-open"
+
+                        if opener:
+                            if shutil.which(opener):
+                                subprocess.Popen([opener, path])
+                            else:
+                                logger.error(f"Opener '{opener}' not found in PATH.")
+                    except Exception as e:
+                        logger.error(f"Failed to open file: {e}")
+                    continue
+
+                elif cmd["command"] == "save_to_downloads":
+                    # Copy the cached file to the User's Download folder
+                    import shutil
+                    src = Path(cmd["path"])
+                    if src.exists():
+                        # Determine Downloads folder
+                        # Linux/Mac fallback: ~/Downloads
+                        dst_dir = Path.home() / "Downloads"
+                        if not dst_dir.exists():
+                             logger.error("Could not find Downloads folder")
+                        else:
+                             dst = dst_dir / src.name
+                             try:
+                                 shutil.copy2(src, dst)
+                                 logger.debug(f"Copied {src.name} to {dst}")
+                             except Exception as e:
+                                 logger.error(f"Failed to copy file: {e}")
+                    else:
+                        logger.error(f"Source file not found: {src}")
+                    continue
                 if cmd.get("service_id") not in backends:
                     logger.debug("Don't know service, ignoring command.")
                     continue # Add continue to avoid crashing on unknown service
@@ -151,6 +195,8 @@ async def main(args=None):
                     # We don't log this to debug by default to avoid spam
                     if hasattr(service, "set_typing_status"):
                         await service.set_typing_status(cmd["channel_id"])
+                else:
+                    logger.warning(f"Received unknown command: {cmd.get('command')}")
             except Exception as e:
                 logger.error(f"Error processing command {cmd.get('command')}: {e}")
     except Exception:
