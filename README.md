@@ -18,6 +18,6 @@ pip install kbunified
 
 ## License
 
-`kbunified` is distributed under the terms of the [GPLv3](https://spdx.org/licenses/GPL-3.0-or-later.html) license.
+`kbunified` is distributed under the terms of the [Apache-v2.0](https://spdx.org/licenses/Apache-2.0.html) license.
 
 
