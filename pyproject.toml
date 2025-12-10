@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = 'KBUnified'
 readme = "README.md"
 requires-python = ">=3.12"
-license = "Apache-v2.0"
+license = "Apache-2.0"
 keywords = []
 authors = [
   { name = "Martin Raspaud", email = "martin.raspaud@smhi.se" },
@@ -30,6 +30,9 @@ dependencies = [
     "requests[mattermost]>=2.32.3",
     "truststore>=0.10.1",
     "websockets>=13.0",
+    "browser_cookie3",
+    "aiohttp>=3.11.12",
+    "python-snappy",
 ]
 
 [project.urls]

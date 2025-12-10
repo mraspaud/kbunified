@@ -93,6 +93,7 @@ def get_slack_credentials():
                     elif name == "d-s": ds_cookie = value
         except Exception as e:
             logger.error(f"Cookie extraction failed: {e}")
+            raise
         finally:
             if temp_db.exists(): temp_db.unlink()
 
@@ -136,6 +137,7 @@ def get_slack_credentials():
                             break
         except Exception as e:
             logger.error(f"Token extraction failed: {e}")
+            raise
 
     if not token:
         logger.warning("Slack xoxc token not found in Local Storage.")
