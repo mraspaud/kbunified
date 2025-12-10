@@ -42,15 +42,16 @@ def emoji_to_shortcode(emoji: str) -> str:
 
 
 mention_pattern = re.compile(r"@([a-z]\d+|[a-z]+\.?[a-z]+)")
+post_display_name_pattern = re.compile(r"@([\w]+(?:\s+[\w]+)*)")
 
 def _get_attachment_path(file_id, file_name):
-        # XDG Standard: ~/.cache/kb-solaria/attachments
-        base = Path.home() / ".cache" / "kb-solaria" / "attachments"
-        base.mkdir(parents=True, exist_ok=True)
+    # XDG Standard: ~/.cache/kb-solaria/attachments
+    base = Path.home() / ".cache" / "kb-solaria" / "attachments"
+    base.mkdir(parents=True, exist_ok=True)
 
-        # Clean filename to prevent path traversal or weird chars
-        safe_name = "".join(c for c in file_name if c.isalnum() or c in "._- ")
-        return base / f"{file_id}_{safe_name}"
+    # Clean filename to prevent path traversal or weird chars
+    safe_name = "".join(c for c in file_name if c.isalnum() or c in "._- ")
+    return base / f"{file_id}_{safe_name}"
 
 def str_to_color(str_in):
     """Converts a UUID into a well-contrasted HTML color string.
@@ -567,18 +568,21 @@ class MattermostBackend(ChatBackend):
     @override
     async def post_message(self, channel_id: ChannelID, message_text: str):
         """Post a message to the service."""
-        await self._post("posts", dict(channel_id=channel_id, message=message_text))
+        body = self.replace_display_names_with_username(message_text)
+        await self._post("posts", dict(channel_id=channel_id, message=body))
 
     @override
     async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str):
         """Reply to a message to the service."""
-        await self._post("posts", dict(channel_id=channel_id, message=message_text, root_id=thread_id))
+        body = self.replace_display_names_with_username(message_text)
+        await self._post("posts", dict(channel_id=channel_id, message=body, root_id=thread_id))
 
     @override
     async def update_message(self, channel_id: ChannelID, message_id: str, new_text: str):
         """Update a message using the new _put helper."""
         # API expects the ID in the payload as well
-        payload = {"id": message_id, "message": new_text, "channel_id": channel_id}
+        body = self.replace_display_names_with_username(new_text)
+        payload = {"id": message_id, "message": body, "channel_id": channel_id}
         await self._put(f"posts/{message_id}", payload)
 
     @override
@@ -622,6 +626,40 @@ class MattermostBackend(ChatBackend):
                 }
             }
             await self._ws.send(json.dumps(payload))
+
+    def replace_display_names_with_username(self, text: str) -> str:
+        """Convert @Display Name to @username for outbound messages."""
+        return post_display_name_pattern.sub(self._replace_dn_with_username, text)
+
+    def _replace_dn_with_username(self, match: re.Match) -> str:
+        original_text = match.group(1)
+
+        # Search caches. We need a Reverse Lookup: Display Name -> Username
+        # Since _users is {id: info}, we iterate or build a map.
+        # Given N is small (<5000), iteration is acceptable for message sending.
+
+        # Backtracking Logic (Same as Slack)
+        parts = original_text.split()
+
+        for i in range(len(parts), 0, -1):
+            candidate = " ".join(parts[:i])
+            remainder = " ".join(parts[i:])
+
+            # Check candidate against all users
+            # Optimization: could cache this map on fetch_all_users
+            target_username = None
+            for u in self._users.values():
+                dname = self._create_display_name(u)
+                if dname == candidate:
+                    target_username = u["username"]
+                    break
+
+            if target_username:
+                if remainder:
+                    return f"@{target_username} {remainder}"
+                return f"@{target_username}"
+
+        return match.group(0)
 
     @override
     async def close(self):

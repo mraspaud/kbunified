@@ -1,3 +1,4 @@
+# src/kbunified/__init__.py
 # SPDX-FileCopyrightText: 2025-present Martin Raspaud <martin.raspaud@smhi.se>
 #
 # SPDX-License-Identifier: GPL-3.0+
@@ -5,6 +6,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,10 +26,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# Explicitly set websockets client to DEBUG
-# This ensures you see the outbound handshake
-logging.getLogger("websockets.client").setLevel(logging.DEBUG)
-logging.getLogger("websockets.server").setLevel(logging.DEBUG)
+# AIOHTTP Logging (Less verbose than websockets, but good to have)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 # If urllib3/requests is used for auth, quiet it down to reduce noise
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -48,29 +49,25 @@ async def merge_events(backends: Iterable[ChatBackend]) -> AsyncGenerator[Event]
             t.cancel()
 
 async def main(args=None):
-    """Main entry point with multiple backends.
-
-    - Starts login for all backends concurrently without waiting for all to complete.
-    - Immediately starts serving events from those backends that are already connected.
-    - Uses a dummy UI to echo an event back as a command.
-    - Returns the echoed command.
-    """
+    """Main entry point with multiple backends."""
     parser = argparse.ArgumentParser()
     parser.add_argument("config_file", type=Path)
+    parser.add_argument("--static-dir", type=Path, default=None, help="Path to static frontend files (dist)")
     opts = parser.parse_args(args)
+
     with opts.config_file.open("rb") as fp:
         config = load(fp)
+
     # Create multiple backends.
-    backends = chat_backends_from_config(
-            **config
-    )
+    backends = chat_backends_from_config(**config)
 
     # Start login tasks concurrently
     login_tasks = [asyncio.create_task(backend.login())
                    for backend in backends.values()]
 
-    logger.debug("Start ui api")
-    ui_api = UIAPI()
+    logger.debug("Starting UI API")
+    # Initialize UI with the static directory (if provided)
+    ui_api = UIAPI(static_dir=opts.static_dir)
 
     async def ui_close():
         await ui_api.close()
@@ -81,14 +78,12 @@ async def main(args=None):
 
     merged_gen = merge_events(backends.values())
 
-
-    # await ui_api.start_command_reception_server()
-    # 1. Start broadcasting events (Non-blocking now)
-
+    # 1. Start broadcasting events (Non-blocking)
     sender_task = asyncio.create_task(ui_api.send_events_to_ui(merged_gen))
 
-    # 2. Start the WebSocket Server (Non-blocking now)
-    server_task = asyncio.create_task(ui_api.start_command_reception_server())
+    # 2. Start the Server (Non-blocking initialization)
+    # The new aiohttp runner starts immediately and runs in the background
+    await ui_api.start()
 
     try:
         # 3. This loop keeps the main program alive while processing commands
@@ -98,8 +93,6 @@ async def main(args=None):
                     path = cmd["path"]
                     logger.debug(f"Opening path: {path}")
                     try:
-                        # Use shutil to check if the tool exists before calling
-                        import shutil
                         opener = None
                         if sys.platform == "win32":
                             os.startfile(path)
@@ -119,11 +112,9 @@ async def main(args=None):
 
                 elif cmd["command"] == "save_to_downloads":
                     # Copy the cached file to the User's Download folder
-                    import shutil
                     src = Path(cmd["path"])
                     if src.exists():
                         # Determine Downloads folder
-                        # Linux/Mac fallback: ~/Downloads
                         dst_dir = Path.home() / "Downloads"
                         if not dst_dir.exists():
                              logger.error("Could not find Downloads folder")
@@ -137,11 +128,12 @@ async def main(args=None):
                     else:
                         logger.error(f"Source file not found: {src}")
                     continue
+
                 if cmd.get("service_id") not in backends:
                     logger.debug("Don't know service, ignoring command.")
-                    continue # Add continue to avoid crashing on unknown service
+                    continue
 
-                service = backends[cmd["service_id"]] # Alias for readability
+                service = backends[cmd["service_id"]]
 
                 if cmd["command"] == "post_message":
                     logger.debug(f"Sending message to {cmd['service_id']}")
@@ -149,12 +141,10 @@ async def main(args=None):
 
                 elif cmd["command"] == "post_reply":
                     logger.debug(f"Sending reply to {cmd['service_id']}")
-                    # Ensure your backend supports this method signature
                     await service.post_reply(cmd["channel_id"], cmd["thread_id"], cmd["body"])
 
                 elif cmd["command"] == "switch_channel":
                     logger.debug(f"Switching channel on {cmd['service_id']}")
-                    # Optional: Some backends don't need explicit switching
                     if hasattr(service, "switch_channel"):
                         await service.switch_channel(cmd["channel_id"], after=cmd.get("after"))
 
@@ -165,7 +155,6 @@ async def main(args=None):
 
                 elif cmd["command"] == "message_update":
                     logger.debug(f"Updating message in {cmd['service_id']}")
-                    # Ensure the backend supports updates
                     if hasattr(service, "update_message"):
                         await service.update_message(cmd["channel_id"], cmd["message_id"], cmd["body"])
 
@@ -175,7 +164,7 @@ async def main(args=None):
                         await service.delete_message(cmd["channel_id"], cmd["message_id"])
 
                 elif cmd["command"] == "react":
-                    action = cmd["action"]  # Default to 'add' if unspecified
+                    action = cmd["action"]
                     emoji = cmd.get("reaction")
                     logger.debug(f"{action.capitalize()}ing reaction '{emoji}' in {cmd['service_id']}")
 
@@ -185,14 +174,13 @@ async def main(args=None):
                     elif action == "remove":
                         if hasattr(service, "remove_reaction"):
                             await service.remove_reaction(cmd["channel_id"], cmd["message_id"], emoji)
+
                 elif cmd["command"] == "mark_read":
                     logger.debug(f"Marking read in {cmd['service_id']}")
                     if hasattr(service, "mark_channel_read"):
-                        # Some backends (Slack) need the timestamp (message_id) to mark 'up to here'
                         await service.mark_channel_read(cmd["channel_id"], cmd["message_id"])
 
                 elif cmd["command"] == "typing":
-                    # We don't log this to debug by default to avoid spam
                     if hasattr(service, "set_typing_status"):
                         await service.set_typing_status(cmd["channel_id"])
                 else:
@@ -202,16 +190,11 @@ async def main(args=None):
     except Exception:
         logger.exception("Bad command or main loop error")
     finally:
-        # Cleanup tasks when we exit
         sender_task.cancel()
-        server_task.cancel()
-
         for backend in backends.values():
             await backend.close()
         await ui_api.close()
 
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     asyncio.run(main())
-

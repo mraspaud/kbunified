@@ -263,9 +263,30 @@ class SlackBackend(ChatBackend):
         return post_mention_pattern.sub(self._replace_mention_with_id, text)
 
     def _replace_mention_with_id(self, match: re.Match) -> str:
-        mention_text = match.group(1)
-        user_id = self._user_name_id.get(mention_text)
-        return f"<@{user_id}>" if user_id else match.group(0)
+        original_text = match.group(1) # e.g. "Alice Hello"
+
+        # 1. Try exact match first (Optimization)
+        if original_text in self._user_name_id:
+            return f"<@{self._user_name_id[original_text]}>"
+
+        # 2. Backtracking Loop
+        # Split "Alice Hello World" -> ["Alice", "Hello", "World"]
+        parts = original_text.split()
+
+        # Try: "Alice Hello World", then "Alice Hello", then "Alice"
+        for i in range(len(parts), 0, -1):
+            candidate = " ".join(parts[:i])
+            remainder = " ".join(parts[i:])
+
+            if candidate in self._user_name_id:
+                user_id = self._user_name_id[candidate]
+                # Reconstruct: <@ID> + space + remainder
+                if remainder:
+                    return f"<@{user_id}> {remainder}"
+                return f"<@{user_id}>"
+
+        # 3. No match found
+        return match.group(0)
 
     # --- DATA FETCHING ---
 
