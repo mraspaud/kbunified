@@ -17,6 +17,7 @@ import aiohttp
 import importlib_resources
 import truststore
 import websockets
+from async_lru import alru_cache
 
 from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event, create_event
 from kbunified.utils.slack_auth import get_slack_credentials
@@ -146,7 +147,7 @@ class SlackBackend(ChatBackend):
     async def _request(self, method, endpoint, **kwargs):
         """Unified request wrapper."""
         url = f"https://slack.com/api/{endpoint}"
-        logger.debug(f"Req: {method} {endpoint} | Data: {kwargs.get('json', '')}")
+        # logger.debug(f"Req: {method} {endpoint} | Data: {kwargs.get('json', '')}")
 
         async with self._session.request(
             method,
@@ -294,8 +295,30 @@ class SlackBackend(ChatBackend):
     async def get_subbed_channels(self):
         channels = []
         try:
+            member_counts = {}
+            cursor = None
+            while True:
+                # Fetch public and private channels to get 'num_members'
+                kwargs = dict()
+                if cursor:
+                    kwargs["cursor"] = cursor
+                convs = await self._get(
+                    "conversations.list",
+                    types="public_channel,private_channel",
+                    limit=1000,
+                    exclude_archived="true",
+                    **kwargs
+                )
+
+                for c in convs.get("channels", []):
+                    member_counts[c["id"]] = c.get("num_members", 1)
+
+                cursor = convs.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+
             data = await self._post("client.userBoot", _x_reason="initial_data", version_all_channels=False,
-                                    omit_channels=False, include_min_version_bumf_check=1,
+                                    omit_channels=False, include_min_version_bumf_check=1, include_num_members=True,
                                     _x_app_name="client")
 
             counts = await self._post("client.counts")
@@ -323,13 +346,21 @@ class SlackBackend(ChatBackend):
                 if latest and "ts" in latest:
                     last_post = float(latest["ts"])
 
-                mass = channel.get("num_members", 1) / total_pop
+                population = member_counts.get(channel_id)
+                if population is None:
+                    # Fallback for MPIMs which calculate via member list length
+                    if "members" in channel:
+                        population = len(channel["members"])
+                    else:
+                        population = channel.get("num_members", 1)
+                mass = population / total_pop
+
                 chan = Channel(id=channel_id,
                                name=name,
                                topic=channel["topic"]["value"],
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
-                               starred=channel_id in data.get("starred", []),
+                               starred=channel_id in data["starred"],
                                last_read_at=last_read,
                                last_post_at=last_post,
                                mass=mass,
@@ -375,41 +406,10 @@ class SlackBackend(ChatBackend):
     async def events(self) -> AsyncGenerator[Event]:
         await self._login_event.wait()
         await self.connect_ws()
-        # 1. Fetch Users
-        await self.fetch_all_users()
 
-        # 2. HANDSHAKE
-        myself = self._users.get(self._user_id)
-        if myself:
-            yield self.create_event(
-                event="self_info",
-                user={
-                    "id": self._user_id,
-                    "name": username(myself),
-                    "color": "#" + myself.get("color", "cccccc")
-                },
-            channel_prefix="#"
-            )
+        for event in await self.get_state_events():
+            yield event
 
-        # 3. Channels
-        channels = await self.get_subbed_channels()
-        yield self.create_event(event="channel_list",
-                                channels=[asdict(chan) for chan in channels])
-
-        user_list = []
-        for u in self._users.values():
-            if u.get("deleted"):
-                continue
-
-            user_list.append({
-                "id": u["id"],
-                "name": username(u),
-                "color": "#" + u.get("color", "cccccc")
-            })
-
-        yield self.create_event(event="user_list", users=user_list)
-
-        # 4. Loop
         async def over_ws():
             async for event in self._ws:
                 await self._inbox.put(event)
@@ -422,11 +422,53 @@ class SlackBackend(ChatBackend):
                     data = json.loads(message)
                     event = await self.handle_event(data)
                     if event:
+                        self.get_state_events.cache_invalidate(self)
                         yield event
                 except json.JSONDecodeError:
                     logger.debug(f"Received non-JSON message: {message}")
         finally:
             ws_task.cancel()
+
+
+    @alru_cache
+    async def get_state_events(self):
+        """Get the current state event for the backend."""
+        events = []
+        await self.fetch_all_users()
+
+        myself = self._users[self._user_id]
+        info_event = self.create_event(
+            event="self_info",
+            user={
+                "id": self._user_id,
+                "name": username(myself),
+                "color": "#" + myself.get("color", "cccccc")
+            },
+        channel_prefix="#"
+        )
+
+        channels = await self.get_subbed_channels()
+        channel_list_event = self.create_event(event="channel_list",
+                                               channels=[asdict(chan) for chan in channels])
+
+        user_list = []
+        for u in self._users.values():
+            if u.get("deleted"):
+                continue
+
+            user_list.append({
+                "id": u["id"],
+                "name": username(u),
+                "color": "#" + u.get("color", "cccccc")
+            })
+
+        user_list_event = self.create_event(event="user_list", users=user_list)
+
+        active_threads = await self.get_participated_threads()
+        active_threads_event = self.create_event(event="thread_subscription_list",
+                                                 thread_ids=active_threads)
+        return info_event, user_list_event, channel_list_event, active_threads_event
+
 
     async def handle_event(self, json_data) -> Event | None:
         etype = json_data["type"]
@@ -635,6 +677,60 @@ class SlackBackend(ChatBackend):
             except:
                 pass
         return body
+
+    @override
+    async def get_participated_threads(self) -> list[str]:
+        """Fetch thread IDs using the internal 'Threads' view endpoint.
+        This replaces the unavailable users.threads endpoint.
+        """
+        try:
+            # Use the internal endpoint found in the HAR trace.
+            # 'priorityMode' generally corresponds to the "Threads" sidebar logic.
+            # 'org_wide_aware' is required for modern grid workspaces.
+            data = await self._post(
+                "subscriptions.thread.getView",
+                fetch_threads_state="true",
+                limit=50,
+                org_wide_aware="true",
+                priorityMode="all",
+                _x_reason="fetch-threads-via-refresh",
+                _x_mode="online",
+                _x_sonic="true",
+                _x_app_name="cient",
+            )
+
+            threads = []
+            if data.get("ok"):
+                for thread in data.get("threads", []):
+                    # 1. Identify IDs
+                    tid = thread.get("root_msg", {}).get("ts")
+                    cid = thread.get("channel_id") # Often at root
+                    if not cid and "root_msg" in thread:
+                         cid = thread["root_msg"].get("channel")
+
+                    if not tid or not cid:
+                        continue
+
+                    # 2. TIMESTAMP BASED UNREAD LOGIC
+                    # The snippet shows these are strings!
+                    last_read = float(thread.get("last_read", 0))
+                    latest_reply = float(thread.get("latest_reply", 0))
+
+                    # Slack logic: It's unread if the newest reply is newer than your last read cursor
+                    is_unread = latest_reply > last_read
+
+                    threads.append({
+                        "id": tid,
+                        "channel_id": cid,
+                        "unread": is_unread
+                    })
+
+            logger.debug(f"Hydrated {len(threads)} participated threads from Slack")
+            return threads
+
+        except Exception:
+            logger.exception("Failed to fetch Slack threads")
+            return []
 
     @override
     async def close(self):

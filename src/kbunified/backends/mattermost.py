@@ -119,6 +119,12 @@ class MattermostBackend(ChatBackend):
         """Get channels with optimized bulk fetching."""
         channels = []
         try:
+            prefs = await self._get(f"users/{self._user_id}/preferences")
+            starred_ids = {
+                p["name"]
+                for p in prefs
+                if p["category"] == "favorite_channel" and p["value"] == "true"
+            }
             # 1. Fetch ALL Channel Metadata (Global info: Name, ID, Last Post)
             # This returns the definitions of the channels.
             all_channels = await self._get(f"users/{self._user_id}/teams/{self._team_id}/channels")
@@ -172,6 +178,7 @@ class MattermostBackend(ChatBackend):
                                   topic=chan["purpose"],
                                   unread=bool(my_data.get("msg_count", 0)),
                                   mentions=my_data.get("mention_count", 0),
+                                  starred=(channel_id in starred_ids),
                                   last_read_at=last_viewed,
                                   last_post_at=last_post,
                                   mass=mass)
@@ -239,7 +246,7 @@ class MattermostBackend(ChatBackend):
     async def _request(self, method, endpoint, **kwargs):
         """Unified wrapper for all HTTP requests."""
         url = f"{self._api_domain}/api/v4/{endpoint}"
-        logger.debug(f"Req: {method} {endpoint} | Data: {kwargs.get('json', '')}")
+        # logger.debug(f"Req: {method} {endpoint} | Data: {kwargs.get('json', '')}")
 
         # Prepare Headers (inject CSRF)
         headers = kwargs.pop("headers", {})
@@ -285,36 +292,9 @@ class MattermostBackend(ChatBackend):
         """Yield real-time events."""
         await self._login_event.wait()
         await self.connect_ws()
-        # Calculate display name using the existing helper
-        my_name = self._create_display_name(self._myself)
 
-        yield self.create_event(
-            event="self_info",
-            user={
-                "id": self._user_id,
-                "name": my_name,
-                "color": str_to_color(self._user_id)
-            },
-            channel_prefix="~"
-        )
-
-        await self.fetch_all_users()
-
-        user_list = []
-        for u in self._users.values():
-            user_list.append({
-                "id": u["id"],
-                "name": self._create_display_name(u),
-                "color": str_to_color(u["id"])
-            })
-
-        yield self.create_event(event="user_list", users=user_list)
-
-        # 3. Then send channels
-        channels = await self.get_subbed_channels()
-        channel_list = self.create_event(event="channel_list",
-                                         channels=[asdict(chan) for chan in channels])
-        yield channel_list
+        for event in await self.get_state_events():
+            yield event
 
         async def over_ws():
             try:
@@ -337,6 +317,7 @@ class MattermostBackend(ChatBackend):
 
                 event = self.handle_event(json.loads(json_event))
                 if event:
+                    self.get_state_events.cache_invalidate(self)
                     yield event
         except Exception:
             logger.error(str(json_event))
@@ -344,6 +325,44 @@ class MattermostBackend(ChatBackend):
             raise
         finally:
             ws_task.cancel()
+
+    @alru_cache
+    async def get_state_events(self):
+        """Get the current state event for the backend."""
+        events = []
+        my_name = self._create_display_name(self._myself)
+
+        info_event = self.create_event(
+            event="self_info",
+            user={
+                "id": self._user_id,
+                "name": my_name,
+                "color": str_to_color(self._user_id)
+            },
+            channel_prefix="~"
+        )
+
+        await self.fetch_all_users()
+
+        user_list = []
+        for u in self._users.values():
+            user_list.append({
+                "id": u["id"],
+                "name": self._create_display_name(u),
+                "color": str_to_color(u["id"])
+            })
+
+        user_list_event = self.create_event(event="user_list", users=user_list)
+
+        # 3. Then send channels
+        channels = await self.get_subbed_channels()
+        channel_list_event = self.create_event(event="channel_list",
+                                               channels=[asdict(chan) for chan in channels])
+
+        active_threads = await self.get_participated_threads()
+        active_threads_event = self.create_event(event="thread_subscription_list",
+                                                 thread_ids=active_threads)
+        return info_event, user_list_event, channel_list_event, active_threads_event
 
     def _create_display_name(self, user):
         return user["nickname"] or (user["first_name"] + " " + user["last_name"]) or user["username"]
@@ -660,6 +679,28 @@ class MattermostBackend(ChatBackend):
                 return f"@{target_username}"
 
         return match.group(0)
+
+    @override
+    async def get_participated_threads(self) -> list[str]:
+        try:
+            # Fetches all threads the user is following
+            data = await self._get(f"users/{self._user_id}/teams/{self._team_id}/threads")
+
+            results = []
+            for t in data.get("threads", []):
+                # Data snippet confirms 'unread_replies' is an integer
+                is_unread = t.get("unread_replies", 0) > 0
+
+                results.append({
+                    "id": t["id"],
+                    "channel_id": t["post"]["channel_id"],
+                    "unread": is_unread
+                })
+            return results
+        except Exception:
+            logger.exception("Failed to fetch Mattermost threads")
+            return []
+
 
     @override
     async def close(self):

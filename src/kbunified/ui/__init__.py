@@ -11,16 +11,35 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from kbunified.backends.interface import Command, Event
+from kbunified.backends.interface import ChatBackend, Command, Event
 
 logger = logging.getLogger("ui")
+
+
+
+async def merge_events(backends: Iterable[ChatBackend]) -> AsyncGenerator[Event]:
+    """Merge events from multiple backends into a single async generator."""
+    queue: asyncio.Queue[Event] = asyncio.Queue()
+    async def pump_events(backend: ChatBackend):
+        async for event in backend.events():
+            await queue.put(event)
+    tasks = [asyncio.create_task(pump_events(backend)) for backend in backends]
+    try:
+        while True:
+            event = await queue.get()
+            yield event
+    finally:
+        for t in tasks:
+            t.cancel()
+
 
 class UIAPI:
     """The UI API class using aiohttp (HTTP + WebSocket)."""
 
-    def __init__(self, static_dir: str = None, port: int = 4722):
+    def __init__(self, backends, static_dir: str = None, port: int = 4722):
         self.port = port
         self.static_dir = Path(static_dir) if static_dir else None
+        self._backends = backends
 
         self._command_q: Queue[Command] = Queue()
         self.connected_clients = set()
@@ -60,13 +79,7 @@ class UIAPI:
 
         # 1. Send Cached State
         try:
-            for handshake in self._handshakes:
-                await ws.send_str(handshake)
-            for chlist in self._channel_lists:
-                await ws.send_str(chlist)
-            for ulist in self._user_lists:
-                await ws.send_str(ulist)
-
+            await self.push_state(ws)
             # 2. Listen Loop
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -84,6 +97,14 @@ class UIAPI:
 
         return ws
 
+    async def push_state(self, ws):
+        for backend in self._backends.values():
+            # FIXME: why can't we do a async for here? why is yield not valid in certain versions of get_state_events
+            for event in await backend.get_state_events():
+                payload = _serialize_event(event)
+                await ws.send_str(payload)
+
+
     async def start(self):
         """Start the aiohttp server (Non-blocking)."""
         self._runner = web.AppRunner(self._app)
@@ -92,29 +113,22 @@ class UIAPI:
         await self._site.start()
         logger.info(f"Solaria Server running on http://127.0.0.1:{self.port}")
 
-    async def send_events_to_ui(self, events: AsyncGenerator[Event, None]):
-        """Consume backend events eagerly and broadcast."""
-        logger.debug("Event broadcaster started")
-        async for item in events:
-            await self.broadcast_event(item)
-
-    async def send_events_to_ui_list(self, events: Iterable[Event]):
-        """Helper for testing: send a list of events immediately."""
-        for item in events:
+    async def send_backend_events_to_ui(self):
+        merged_gen = merge_events(self._backends.values())
+        async for item in merged_gen:
             await self.broadcast_event(item)
 
     async def broadcast_event(self, item: Event):
         """Serialize and send an event to all connected clients."""
         try:
             # Serialize
+            payload = _serialize_event(item)
+
+            # Cache Critical State
             if is_dataclass(item):
                 data = asdict(item)
             else:
                 data = item
-
-            payload = json.dumps(data)
-
-            # Cache Critical State
             evt_type = data.get("event")
             if evt_type == "self_info":
                 self._handshakes.append(payload)
@@ -146,3 +160,11 @@ class UIAPI:
             await self._site.stop()
         if self._runner:
             await self._runner.cleanup()
+
+def _serialize_event(event):
+    if is_dataclass(event):
+        data = asdict(event)
+    else:
+        data = event
+
+    return json.dumps(data)

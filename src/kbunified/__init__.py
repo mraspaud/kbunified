@@ -32,20 +32,6 @@ logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 
-async def merge_events(backends: Iterable[ChatBackend]) -> AsyncGenerator[Event]:
-    """Merge events from multiple backends into a single async generator."""
-    queue: asyncio.Queue[Event] = asyncio.Queue()
-    async def pump_events(backend: ChatBackend):
-        async for event in backend.events():
-            await queue.put(event)
-    tasks = [asyncio.create_task(pump_events(backend)) for backend in backends]
-    try:
-        while True:
-            event = await queue.get()
-            yield event
-    finally:
-        for t in tasks:
-            t.cancel()
 
 async def main(args=None):
     """Main entry point with multiple backends."""
@@ -66,7 +52,7 @@ async def main(args=None):
 
     logger.debug("Starting UI API")
     # Initialize UI with the static directory (if provided)
-    ui_api = UIAPI(static_dir=opts.static_dir)
+    ui_api = UIAPI(backends, static_dir=opts.static_dir)
 
     async def ui_close():
         await ui_api.close()
@@ -75,10 +61,8 @@ async def main(args=None):
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(ui_close()))
 
-    merged_gen = merge_events(backends.values())
-
     # 1. Start broadcasting events (Non-blocking)
-    sender_task = asyncio.create_task(ui_api.send_events_to_ui(merged_gen))
+    sender_task = asyncio.create_task(ui_api.send_backend_events_to_ui())
 
     # 2. Start the Server (Non-blocking initialization)
     # The new aiohttp runner starts immediately and runs in the background

@@ -95,6 +95,11 @@ class ChatBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def get_participated_threads(self) -> list[str]:
+        """Return a list of thread IDs the user is participating in."""
+        return []
+
+    @abstractmethod
     async def close(self):
         """Close the connection to the service and shut down."""
 

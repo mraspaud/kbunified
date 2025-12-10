@@ -15,6 +15,7 @@ from typing import override
 import aiohttp
 import truststore
 from aiohttp import WSMsgType
+from async_lru import alru_cache
 
 from kbunified.backends.interface import Channel, ChatBackend, Event, create_event
 from kbunified.utils.rocketchat_auth import get_rocketchat_credentials
@@ -78,7 +79,7 @@ class RocketChatBackend(ChatBackend):
         self._running = True
         self._login_event = asyncio.Event()
         self._inbox = asyncio.Queue()
-        self._ws = None
+        self._ws = []
 
         self._users = {}
         self._channels = {}
@@ -282,18 +283,9 @@ class RocketChatBackend(ChatBackend):
     @override
     async def events(self) -> AsyncGenerator[Event]:
         await self._login_event.wait()
-        await self.fetch_all_users()
 
-        yield self.create_event(event="self_info", user={
-            "id": self._user_id,
-            "name": self._username,
-            "color": str_to_color(self._user_id)
-        })
-
-        yield self.create_event(event="user_list", users=list(self._users.values()))
-
-        channels = await self.get_subbed_channels()
-        yield self.create_event(event="channel_list", channels=[asdict(c) for c in channels])
+        for event in await self.get_state_events():
+            yield event
 
         ws_task = asyncio.create_task(self._connection_loop())
 
@@ -314,9 +306,31 @@ class RocketChatBackend(ChatBackend):
                 else:
                     event = await self.handle_ws_message(data)
                     if event:
+                        self.get_state_events.cache_invalidate(self)
                         yield event
         finally:
             ws_task.cancel()
+
+    @alru_cache
+    async def get_state_events(self):
+        """Get the current state event for the backend."""
+        await self.fetch_all_users()
+
+        info_event = self.create_event(event="self_info", user={
+            "id": self._user_id,
+            "name": self._username,
+            "color": str_to_color(self._user_id)
+        })
+        user_list_event = self.create_event(event="user_list", users=list(self._users.values()))
+
+        channels = await self.get_subbed_channels()
+        channel_list_event = self.create_event(event="channel_list", channels=[asdict(c) for c in channels])
+        return info_event, user_list_event, channel_list_event
+    #
+    #     active_threads = await self.get_participated_threads()
+    #     active_threads_event = self.create_event(event="thread_subscription_list",
+    #                                              thread_ids=active_threads)
+    #     return info_event, user_list_event, channel_list_event, active_threads_event
 
     async def _connection_loop(self):
         while self._running:
@@ -463,6 +477,36 @@ class RocketChatBackend(ChatBackend):
     @override
     async def is_logged_in(self) -> bool:
         return self._auth_token is not None
+
+    @override
+    async def get_participated_threads(self) -> list[str]:
+        """Hydrate thread context using Rocket.Chat's subscription metadata.
+        We aggregate all 'tunread' lists to find threads the user needs to see.
+        """
+        try:
+            # subscriptions.get returns ALL room memberships and their states
+            data = await self._get("subscriptions.get")
+            threads = set()
+
+            for sub in data.get("update", []):
+                # 1. Standard Unread Threads
+                if "tunread" in sub and sub["tunread"]:
+                    threads.update(sub["tunread"])
+
+                # 2. Threads with Direct Mentions
+                if "tunreadUser" in sub and sub["tunreadUser"]:
+                    threads.update(sub["tunreadUser"])
+
+                # 3. Threads with Group Mentions
+                if "tunreadGroup" in sub and sub["tunreadGroup"]:
+                    threads.update(sub["tunreadGroup"])
+
+            logger.debug(f"Hydrated {len(threads)} active threads from Rocket.Chat")
+            return list(threads)
+
+        except Exception:
+            logger.exception("Failed to fetch Rocket.Chat subscription threads")
+            return []
 
     @override
     async def close(self):
