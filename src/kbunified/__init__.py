@@ -112,8 +112,16 @@ async def main(args=None):
                         logger.error(f"Source file not found: {src}")
                     continue
 
-                if cmd.get("service_id") not in backends:
-                    logger.debug("Don't know service, ignoring command.")
+                service_id = cmd.get("service_id")
+
+                # Check 1: Is service_id missing completely?
+                if not service_id:
+                    logger.error(f"❌ Command '{cmd.get('command')}' missing 'service_id'. Received: {cmd}")
+                    continue
+
+                # Check 2: Is service_id unknown?
+                if service_id not in backends:
+                    logger.warning(f"⚠️ Unknown service_id '{service_id}'. Available: {list(backends.keys())}")
                     continue
 
                 service = backends[cmd["service_id"]]

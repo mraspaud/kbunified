@@ -20,6 +20,7 @@ class Channel:
     last_read_at: float = 0.0
     last_post_at: float = 0.0
     mass: float = 1
+    category: str = "channel"
 
 class ChatBackend(ABC):
     """Chat backend."""
@@ -111,14 +112,15 @@ class ChatBackend(ABC):
 
 def create_channel(channel_id: str, name: str, topic: str,
                    unread: bool = False, mentions: int = 0,
-                   starred: bool = False, last_read_at: float = 0.0):
+                   starred: bool = False, last_read_at: float = 0.0, category: str = "channel"):
     """Create a channel."""
     return dict(id=channel_id, name=name,
                 unread=unread,
                 topic=topic,
                 mentions=mentions,
                 starred=starred,
-                last_read_at=last_read_at)
+                last_read_at=last_read_at,
+                category=category)
 
 def create_event(event: str, service: dict[str, str], **fields: str | dict[str, str] | list[dict[str, str]]) -> Event:
     """Create an event."""

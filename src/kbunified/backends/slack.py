@@ -63,7 +63,7 @@ def replace_emojis_in_text(text):
 
 
 mention_pattern = re.compile(r"<@([A-Z0-9]+)>")
-post_mention_pattern = re.compile(r"@([\w]+(?:\s+[\w]+)*)")
+post_mention_pattern = re.compile(r"@([a-zA-Z0-9_\-\.\(\)]+(?:\s+[a-zA-Z0-9_\-\.\(\)]+)*)")
 
 def _get_attachment_path(file_id, file_name):
     base = Path.home() / ".cache" / "kb-solaria" / "attachments"
@@ -355,6 +355,8 @@ class SlackBackend(ChatBackend):
                         population = channel.get("num_members", 1)
                 mass = population / total_pop
 
+                category = "group" if channel.get("is_mpim") else "channel"
+
                 chan = Channel(id=channel_id,
                                name=name,
                                topic=channel["topic"]["value"],
@@ -364,6 +366,7 @@ class SlackBackend(ChatBackend):
                                last_read_at=last_read,
                                last_post_at=last_post,
                                mass=mass,
+                               category=category
                                )
                 channels.append(chan)
                 logger.debug(f"Added {chan}")
@@ -386,7 +389,8 @@ class SlackBackend(ChatBackend):
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
                                starred=channel_id in data.get("starred", []),
-                               mass=1/total_pop
+                               mass=1/total_pop,
+                               category="direct",
                                )
                 channels.append(chan)
                 logger.debug(f"Added {chan}")
@@ -467,6 +471,7 @@ class SlackBackend(ChatBackend):
         active_threads = await self.get_participated_threads()
         active_threads_event = self.create_event(event="thread_subscription_list",
                                                  thread_ids=active_threads)
+        # logger.debug(active_threads_event)
         return info_event, user_list_event, channel_list_event, active_threads_event
 
 
