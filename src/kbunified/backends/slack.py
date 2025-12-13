@@ -8,58 +8,22 @@ import ssl
 from collections.abc import AsyncGenerator
 from dataclasses import asdict
 from datetime import datetime
-from functools import cache
 from pathlib import Path
 from pprint import pp
 from typing import override
 
 import aiohttp
-import importlib_resources
 import truststore
 import websockets
 from async_lru import alru_cache
 
 from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event, create_event
+from kbunified.utils.emoji import EmojiManager
 from kbunified.utils.slack_auth import get_slack_credentials
 
 logger = logging.getLogger("slack_backend")
 
 ua = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
-
-@cache
-def loaded_emojis():
-    """Load emojis from file."""
-    resources = importlib_resources.files("kbunified")
-    return json.loads(resources.joinpath("data", "slack_emojis.json").read_text())
-
-def get_emoji(code):
-    """Get emoji corresponding to code."""
-    emojis = loaded_emojis()
-    try:
-        return emojis[code]
-    except KeyError:
-        return code
-
-def name_of_reaction(em):
-    # Reverse lookup for sending reactions
-    x = loaded_emojis()
-    for name, char in x.items():
-        if char == em:
-            return name
-    return em.replace(":", "")
-
-
-emoji_pattern = re.compile(r":([a-zA-Z0-9_\-+]+):")
-
-
-def replace_emoji(match):
-    code = match.group(1)
-    return get_emoji(code)
-
-
-def replace_emojis_in_text(text):
-    if not text: return ""
-    return emoji_pattern.sub(replace_emoji, text)
 
 
 mention_pattern = re.compile(r"<@([A-Z0-9]+)>")
@@ -107,6 +71,7 @@ class SlackBackend(ChatBackend):
 
         # WebSocket URL does require token in query usually
         self._ws_url = f"wss://wss-primary.slack.com/?token={self._session_token}"
+        self.emojis = EmojiManager()
 
     async def is_logged_in(self):
         """Return logged-in status."""
@@ -185,17 +150,27 @@ class SlackBackend(ChatBackend):
         except Exception:
             logger.exception(f"Failed to download file to {path}")
 
-    # --- ACTIONS ---
 
     @override
-    async def post_message(self, channel_id: ChannelID, message_text: str):
+    async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:
         modified_body = self.replace_usernames_with_id(message_text)
-        return await self._post("chat.postMessage", channel=channel_id, text=modified_body)
+        kwargs = {"channel": channel_id, "text": modified_body}
+        if client_id:
+            kwargs["client_msg_id"] = client_id # Worth a try
+
+        data = await self._post("chat.postMessage", **kwargs)
+        return data.get("ts")
 
     @override
-    async def post_reply(self, channel_id, thread_id, message_text):
+    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str,
+                         client_id: str | None = None) -> str | None:
         modified_body = self.replace_usernames_with_id(message_text)
-        return await self._post("chat.postMessage", channel=channel_id, text=modified_body, thread_ts=thread_id)
+        kwargs = {"channel": channel_id, "text": modified_body, "thread_ts": thread_id}
+        if client_id:
+            kwargs["client_msg_id"] = client_id
+
+        data = await self._post("chat.postMessage", **kwargs)
+        return data.get("ts")
 
     @override
     async def update_message(self, channel_id: ChannelID, message_id: str, new_text: str):
@@ -211,7 +186,7 @@ class SlackBackend(ChatBackend):
     @override
     async def send_reaction(self, channel_id, message_id, reaction):
         try:
-            name = name_of_reaction(reaction)
+            name = self.emojis.get_shortcode(reaction)
         except KeyError:
             logger.error(f"'{reaction}' unknown")
             return
@@ -221,7 +196,7 @@ class SlackBackend(ChatBackend):
     async def remove_reaction(self, channel_id, message_id, reaction):
         # NEW!!!
         try:
-            name = name_of_reaction(reaction)
+            name = self.emojis.get_shortcode(reaction)
         except KeyError:
             logger.error(f"'{reaction}' unknown")
             return
@@ -304,12 +279,11 @@ class SlackBackend(ChatBackend):
                     kwargs["cursor"] = cursor
                 convs = await self._get(
                     "conversations.list",
-                    types="public_channel,private_channel",
+                    types="public_channel,private_channel,mpim,im",
                     limit=1000,
                     exclude_archived="true",
                     **kwargs
                 )
-
                 for c in convs.get("channels", []):
                     member_counts[c["id"]] = c.get("num_members", 1)
 
@@ -322,7 +296,7 @@ class SlackBackend(ChatBackend):
                                     _x_app_name="client")
 
             counts = await self._post("client.counts")
-            metadata = {count["id"]: count for count in counts["channels"] + counts["ims"]}
+            metadata = {count["id"]: count for count in counts["channels"] + counts["ims"] + counts["mpims"]}
             total_pop = len(self._users) if self._users else 1
 
             for channel in data["channels"]:
@@ -331,7 +305,7 @@ class SlackBackend(ChatBackend):
 
                 channel_id = channel["id"]
                 meta = metadata.get(channel_id, {})
-                last_read = float(meta.get("last_read", 0))
+                last_read = float(meta.get("last_read", channel.get("last_read", 0)))
                 name = channel["name"]
                 # beautify mpdm names
                 if channel.get("is_mpim"):
@@ -341,10 +315,13 @@ class SlackBackend(ChatBackend):
                         members.append(username(user))
                     name = ", ".join(members)
 
-                last_post = 0.0
-                latest = channel.get("latest") # Message object
-                if latest and "ts" in latest:
-                    last_post = float(latest["ts"])
+                last_post = meta.get("latest", 0)
+                if last_post == 0:
+                    last_post = channel["created"]
+                else:
+                    last_post = float(last_post)
+                if last_read <= 1 and not meta.get("has_unreads", False):
+                    last_read = last_post
 
                 population = member_counts.get(channel_id)
                 if population is None:
@@ -383,12 +360,16 @@ class SlackBackend(ChatBackend):
                 channel_id = im["id"]
                 meta = metadata.get(channel_id, {})
 
+                last_read = float(meta.get("last_read", 0))
+                last_post = float(meta.get("latest", im.get("latest", 0)))
                 chan = Channel(id=channel_id,
                                name=user_name,
                                topic=f"Conversation with {user_name}",
                                unread=meta.get("has_unreads", False),
                                mentions=meta.get("mention_count", 0),
                                starred=channel_id in data.get("starred", []),
+                               last_read_at=last_read,
+                               last_post_at=last_post,
                                mass=1/total_pop,
                                category="direct",
                                )
@@ -485,7 +466,7 @@ class SlackBackend(ChatBackend):
             if subtype == "message_changed":
                 new_json = json_data["message"]
                 new_json["channel"] = json_data["channel"]
-                body = replace_emojis_in_text(new_json["text"])
+                body = self.emojis.replace_text(new_json["text"])
                 body = await self.replace_mentions_in_text(body)
 
                 return self.create_event(
@@ -517,7 +498,7 @@ class SlackBackend(ChatBackend):
                 action="add" if etype == "reaction_added" else "remove",
                 message_id=item["ts"],
                 channel_id=item["channel"],
-                emoji=get_emoji(json_data["reaction"]),
+                emoji=self.emojis.get_emoji(json_data["reaction"]),
                 user_id=json_data["user"]
             )
 
@@ -618,16 +599,17 @@ class SlackBackend(ChatBackend):
                 author = dict(id="bot", name=blob.get("username", "Bot"), color="#cccccc")
 
             text = blob.get("text", "")
-            body = replace_emojis_in_text(text)
+            body = self.emojis.replace_text(text)
             body = await self.replace_mentions_in_text(body)
 
             timestamp = float(blob["ts"])
             dt = datetime.fromtimestamp(timestamp)
             timestamp = int(timestamp * 1000)
-
+            client_id = blob.get("client_msg_id")
             message = dict(body=body,
                            author=author,
                            id=message_id,
+                           client_id=client_id,
                            timestamp=timestamp,
                            ts_date=dt.date().isoformat(),
                            ts_time=dt.time().isoformat())
@@ -638,7 +620,7 @@ class SlackBackend(ChatBackend):
             if "reactions" in blob:
                 reactions = {}
                 for rx in blob["reactions"]:
-                    emoji = get_emoji(rx["name"])
+                    emoji = self.emojis.get_emoji(rx["name"])
                     reactions[emoji] = rx["users"]
                 message["reactions"] = reactions
 

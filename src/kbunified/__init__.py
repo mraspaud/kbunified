@@ -126,13 +126,35 @@ async def main(args=None):
 
                 service = backends[cmd["service_id"]]
 
+
                 if cmd["command"] == "post_message":
                     logger.debug(f"Sending message to {cmd['service_id']}")
-                    await service.post_message(cmd["channel_id"], cmd["body"])
+                    client_id = cmd.get("client_id")
+                    # Backend call does NOT need client_id anymore
+                    new_id = await service.post_message(cmd["channel_id"], cmd["body"], client_id=client_id)
+
+                    # Synthesize Ack
+                    if new_id and client_id:
+                        ack_event = {
+                            "event": "message_ack",
+                            "client_id": client_id,
+                            "real_id": new_id
+                            # "text": cmd["body"] # Optional: echo back if you want
+                        }
+                        await ui_api.broadcast_event(ack_event)
 
                 elif cmd["command"] == "post_reply":
                     logger.debug(f"Sending reply to {cmd['service_id']}")
-                    await service.post_reply(cmd["channel_id"], cmd["thread_id"], cmd["body"])
+                    client_id = cmd.get("client_id")
+                    new_id = await service.post_reply(cmd["channel_id"], cmd["thread_id"], cmd["body"], client_id=client_id)
+
+                    if new_id and client_id:
+                        ack_event = {
+                            "event": "message_ack",
+                            "client_id": client_id,
+                            "real_id": new_id
+                        }
+                        await ui_api.broadcast_event(ack_event)
 
                 elif cmd["command"] == "switch_channel":
                     logger.debug(f"Switching channel on {cmd['service_id']}")

@@ -17,7 +17,8 @@ import truststore
 from aiohttp import WSMsgType
 from async_lru import alru_cache
 
-from kbunified.backends.interface import Channel, ChatBackend, Event, create_event
+from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event, create_event
+from kbunified.utils.emoji import EmojiManager
 from kbunified.utils.rocketchat_auth import get_rocketchat_credentials
 
 logger = logging.getLogger("rocketchat_backend")
@@ -42,6 +43,14 @@ def _get_attachment_path(file_id, file_name):
     base.mkdir(parents=True, exist_ok=True)
     safe_name = "".join(c for c in file_name if c.isalnum() or c in "._- ")
     return base / f"{file_id}_{safe_name}"
+
+
+def _get_ts_from_rc_blob(blob):
+    try:
+        return int(datetime.fromisoformat(blob.replace("Z", "+00:00")).timestamp() * 1000)
+    except AttributeError:
+        return blob["$date"]
+
 
 class RocketChatBackend(ChatBackend):
     """The Rocket.Chat backend."""
@@ -84,6 +93,20 @@ class RocketChatBackend(ChatBackend):
         self._users = {}
         self._channels = {}
         self._room_types = {}
+        self.emojis = EmojiManager()
+
+    async def _ddp_heartbeat(self):
+        """Sends a DDP-level ping every 30 seconds to keep the session alive."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                if self._ws and not self._ws.closed:
+                    # DDP Ping (Server responds with {"msg": "pong"})
+                    await self._send_ws({"msg": "ping"})
+                    logger.debug("Sent DDP Ping")
+            except Exception:
+                # If we fail to ping, the connection loop will handle the restart
+                pass
 
     @override
     async def login(self):
@@ -165,7 +188,7 @@ class RocketChatBackend(ChatBackend):
         self._ws = await self._session.ws_connect(
             self._ws_url,
             ssl=self.ssl_ctx,
-            heartbeat=30
+            # heartbeat=30
         )
         await self._send_ws({"msg": "connect", "version": "1", "support": ["1"]})
 
@@ -185,6 +208,7 @@ class RocketChatBackend(ChatBackend):
 
     async def _send_ws(self, msg):
         if self._ws and not self._ws.closed:
+            # logger.debug(f"RC Sent through ws {datetime.now()}:\n" + str(msg))
             await self._ws.send_json(msg)
 
     async def _sub_ws(self, name, *params):
@@ -235,17 +259,11 @@ class RocketChatBackend(ChatBackend):
 
                 last_read = 0.0
                 if "ls" in sub and isinstance(sub["ls"], str):
-                    try:
-                        dt = datetime.fromisoformat(sub["ls"].replace("Z", "+00:00"))
-                        last_read = dt.timestamp()
-                    except: pass
+                    last_read = _get_ts_from_rc_blob(sub["ls"]) / 1000
 
                 last_post = 0.0
                 if "lm" in sub and isinstance(sub["lm"], str):
-                    try:
-                        dt = datetime.fromisoformat(sub["lm"].replace("Z", "+00:00"))
-                        last_post = dt.timestamp()
-                    except: pass
+                    last_post = _get_ts_from_rc_blob(sub["lm"]) / 1000
 
                 chan = Channel(
                     id=cid,
@@ -288,6 +306,7 @@ class RocketChatBackend(ChatBackend):
             yield event
 
         ws_task = asyncio.create_task(self._connection_loop())
+        # ka_task = asyncio.create_task(self._ddp_heartbeat())
 
         try:
             while self._running:
@@ -308,12 +327,16 @@ class RocketChatBackend(ChatBackend):
                     if event:
                         self.get_state_events.cache_invalidate(self)
                         yield event
+        except Exception:
+            logger.exception("oh no...")
         finally:
             ws_task.cancel()
+            # ka_task.cancel()
 
     @alru_cache
     async def get_state_events(self):
         """Get the current state event for the backend."""
+        # ws_task = asyncio.create_task(self.fetch_custom_emojis())
         await self.fetch_all_users()
 
         info_event = self.create_event(event="self_info", user={
@@ -339,6 +362,8 @@ class RocketChatBackend(ChatBackend):
                 async for msg in self._ws:
                     if msg.type == WSMsgType.TEXT:
                         data = json.loads(msg.data)
+
+                        # logger.debug(f"Received from ws at {datetime.now()}:\n" + str(data))
                         if data.get("msg") == "ping":
                             await self._send_ws({"msg": "pong"})
                             continue
@@ -378,16 +403,29 @@ class RocketChatBackend(ChatBackend):
                 "real_name": m["u"].get("name"),
                 "color": str_to_color(uid)
             }
-
-        ts = int(datetime.fromisoformat(m["ts"].replace("Z", "+00:00")).timestamp() * 1000)
+        ts = _get_ts_from_rc_blob(m["ts"])
         dt = datetime.fromtimestamp(ts/1000)
 
         # Display Name Resolution - ROBUST
         display_name = author.get("real_name") or author.get("name") or "Unknown"
 
+        rc_type = self._room_types.get(rid, "c")
+        category = "channel"
+        if rc_type == "d":
+            category = "direct"
+        elif rc_type == "p":
+            category = "group"
+
+        # 2. Resolve Client ID (Optimism)
+        client_id = None
+        if uid == self._user_id:
+            client_id = m["_id"]
+
         msg = {
             "id": m["_id"],
-            "body": m.get("msg", ""),
+            "body": self.emojis.replace_text(m.get("msg", "")),
+            "client_id": client_id,
+            "channel_category": category,
             "author": {
                 "id": author["id"],
                 "name": author["name"],
@@ -398,6 +436,25 @@ class RocketChatBackend(ChatBackend):
             "ts_date": dt.date().isoformat(),
             "ts_time": dt.time().isoformat()
         }
+
+        if "tmid" in m:
+            msg["thread_id"] = m["tmid"]
+
+        if "tcount" in m:
+            msg["replies"] = {"count": m["tcount"]}
+
+        # --- NEW: Reactions Support ---
+        if "reactions" in m:
+            reactions = {}
+            for emoji, details in m["reactions"].items():
+                # RocketChat emojis might come as ':smile:', strip colons
+                clean_emoji = self.emojis.get_emoji(emoji)
+                # 'usernames' is a list of usernames, we might want IDs if possible,
+                # but RC often sends usernames in this blob.
+                # Ideally we map back to IDs, but for now usernames are often accepted by UI.
+                # If your UI strictly needs IDs, we'd have to lookup via self._users.
+                reactions[clean_emoji] = details.get("usernames", [])
+            msg["reactions"] = reactions
 
         if "attachments" in m:
             atts = []
@@ -413,19 +470,78 @@ class RocketChatBackend(ChatBackend):
 
         return self.create_event(event="message", channel_id=rid, message=msg)
 
+
     # --- ACTIONS ---
 
-    @override
-    async def post_message(self, channel_id, message_text):
-        await self._post("chat.postMessage", {"roomId": channel_id, "text": message_text})
+    async def _call_method(self, method, *params):
+        """Call a DDP method via WebSocket."""
+        for _ in range(10):
+            if self._ws and not self._ws.closed:
+                break
+            await asyncio.sleep(0.5)
+
+        if not self._ws or self._ws.closed:
+            logger.error(f"Failed to send {method}: WS disconnected")
+            return
+
+        msg_id = hashlib.md5(f"{method}{params}{datetime.now()}".encode()).hexdigest()
+        msg = {
+            "msg": "method",
+            "method": method,
+            "params": list(params),
+            "id": msg_id
+        }
+
+        await self._send_ws(msg)
+
+    # async def fetch_custom_emojis(self):
+    #     try:
+    #         data = await self._get("emoji-custom.list")
+    #         if data.get("success"):
+    #             base_url = self._http_base
+    #             print(data)
+    #             for em in data.get("emojis", []):
+    #                 name = em["name"]
+    #                 ext = em.get("extension", "png")
+    #                 url = f"{base_url}/emoji-custom/{name}.{ext}"
+    #
+    #                 self.emojis.register_custom(name, url)
+    #                 for alias in em.get("aliases", []):
+    #                     self.emojis.register_custom(alias, url)
+    #     except Exception:
+    #         logger.exception("Failed to fetch RC custom emojis")
 
     @override
-    async def post_reply(self, channel_id, thread_id, message_text):
-        await self._post("chat.postMessage", {
-            "roomId": channel_id,
-            "text": message_text,
-            "tmid": thread_id
-        })
+    async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:
+        if not client_id:
+            import uuid
+            client_id = str(uuid.uuid4())
+
+        message_obj = {
+            "_id": client_id,
+            "rid": channel_id,
+            "msg": message_text
+        }
+
+        await self._call_method("sendMessage", message_obj)
+
+        return client_id
+
+    @override
+    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str, client_id: str | None = None) -> str | None:
+        if not client_id:
+            import uuid
+            client_id = str(uuid.uuid4())
+
+        message_obj = {
+            "_id": client_id,
+            "rid": channel_id,
+            "msg": message_text,
+            "tmid": thread_id # Thread ID
+        }
+
+        await self._call_method("sendMessage", message_obj)
+        return client_id
 
     @override
     async def update_message(self, channel_id, message_id, new_text):
@@ -437,12 +553,12 @@ class RocketChatBackend(ChatBackend):
 
     @override
     async def send_reaction(self, channel_id, message_id, reaction):
-        emoji = reaction.replace(":", "")
+        emoji = self.emojis.get_shortcode(reaction)
         await self._post("chat.react", {"messageId": message_id, "emoji": emoji})
 
     @override
     async def remove_reaction(self, channel_id, message_id, reaction):
-        emoji = reaction.replace(":", "")
+        emoji = self.emojis.get_shortcode(reaction)
         await self._post("chat.react", {"messageId": message_id, "emoji": emoji})
 
     @override
@@ -472,11 +588,60 @@ class RocketChatBackend(ChatBackend):
                             await self._inbox.put(event) # Put DICT, not JSON string
                     return
             except Exception:
-                pass
+                logger.exception("Something went wrong when switching channels")
+
+    @override
+    async def fetch_thread(self, channel_id: ChannelID, thread_id: str, after: str | None = None):
+        """Fetch messages from a thread."""
+        # Endpoint: /api/v1/chat.getThreadMessages
+        # Rocket.Chat typically uses 'offset' rather than cursor IDs for this endpoint,
+        # but we'll stick to a reasonable default count for parity.
+        params = {"tmid": thread_id, "count": 100}
+
+        # If strict pagination is needed later, 'after' logic would convert to 'offset' here.
+
+        try:
+            res = await self._get("chat.getThreadMessages", **params)
+
+            if res.get("success"):
+                messages = res.get("messages", [])
+
+                # Rocket.Chat returns newest first.
+                # We reverse to push oldest -> newest to the UI.
+                for m in reversed(messages):
+                    event = self._parse_message(m)
+                    if event:
+                        # Unlike Slack/Mattermost which sometimes push raw JSON strings,
+                        # this backend's event loop handles pre-parsed dicts gracefully.
+                        await self._inbox.put(event)
+            else:
+                logger.error(f"Failed to fetch thread {thread_id}: {res.get('error', 'Unknown error')}")
+
+        except Exception:
+            logger.exception("Something went wrong when fetching thread")
 
     @override
     async def is_logged_in(self) -> bool:
         return self._auth_token is not None
+
+    @override
+    async def mark_channel_read(self, channel_id: ChannelID, message_id: str):
+        """Mark the channel as read."""
+        # Rocket.Chat marks the entire subscription as read by Room ID
+        await self._post("subscriptions.read", {"rid": channel_id})
+
+    @override
+    async def set_typing_status(self, channel_id: ChannelID):
+        """Send typing indicator via WebSocket."""
+        if self._ws and not self._ws.closed:
+            # DDP method call
+            msg = {
+                "msg": "method",
+                "method": "stream-notify-room",
+                "params": [f"{channel_id}/typing", self._username, True],
+                "id": f"typing_{int(datetime.now().timestamp())}"
+            }
+            await self._send_ws(msg)
 
     @override
     async def get_participated_threads(self) -> list[str]:

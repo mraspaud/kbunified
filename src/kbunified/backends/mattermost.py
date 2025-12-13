@@ -22,7 +22,7 @@ from async_lru import alru_cache
 from requests.utils import dict_from_cookiejar
 
 from kbunified.backends.interface import Channel, ChannelID, ChatBackend, Event
-from kbunified.backends.slack import get_emoji
+from kbunified.utils.emoji import EmojiManager
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,7 @@ class MattermostBackend(ChatBackend):
         self._team_id = data[0]["id"]
 
         self._login_event.set()
+        self.emojis = EmojiManager()
 
     @override
     async def get_subbed_channels(self) -> list[Channel]:
@@ -475,13 +476,18 @@ class MattermostBackend(ChatBackend):
 
         display_name = self._create_display_name(user)
 
+        client_id = post.get("pending_post_id")
+
         # 1. Basic Message Construction
-        message = dict(body=self.replace_mentions_in_text(post["message"]),
+        text_with_names = self.replace_mentions_in_text(post["message"])
+        body = self.emojis.replace_text(text_with_names)
+        message = dict(body=body,
                        author=dict(id=user["id"],
                                    display_name=display_name,
                                    color=str_to_color(user["id"])
                                    ),
                        id=post["id"],
+                       client_id=client_id,
                        timestamp=ts,
                        ts_date=dt.date().isoformat(),
                        ts_time=dt.time().isoformat())
@@ -495,7 +501,7 @@ class MattermostBackend(ChatBackend):
         if post.get("has_reactions"):
             reactions = defaultdict(list)
             for reaction in post["metadata"]["reactions"]:
-                reactions[get_emoji(reaction["emoji_name"])].append(reaction["user_id"])
+                reactions[self.emojis.get_emoji(reaction["emoji_name"])].append(reaction["user_id"])
             message["reactions"] = reactions
 
         files = post.get("metadata", {}).get("files", [])
@@ -593,16 +599,24 @@ class MattermostBackend(ChatBackend):
         return super().is_logged_in()
 
     @override
-    async def post_message(self, channel_id: ChannelID, message_text: str):
-        """Post a message to the service."""
+    async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:
         body = self.replace_display_names_with_username(message_text)
-        await self._post("posts", dict(channel_id=channel_id, message=body))
+        payload = {"channel_id": channel_id, "message": body}
+        if client_id:
+            payload["pending_post_id"] = client_id
+
+        data = await self._post("posts", payload)
+        return data.get("id")
 
     @override
-    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str):
-        """Reply to a message to the service."""
+    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str, client_id: str | None = None) -> str | None:
         body = self.replace_display_names_with_username(message_text)
-        await self._post("posts", dict(channel_id=channel_id, message=body, root_id=thread_id))
+        payload = {"channel_id": channel_id, "message": body, "root_id": thread_id}
+        if client_id:
+            payload["pending_post_id"] = client_id
+
+        data = await self._post("posts", payload)
+        return data.get("id")
 
     @override
     async def update_message(self, channel_id: ChannelID, message_id: str, new_text: str):
@@ -623,7 +637,7 @@ class MattermostBackend(ChatBackend):
         payload = {
             "user_id": self._user_id,
             "post_id": message_id,
-            "emoji_name": emoji_to_shortcode(reaction)
+            "emoji_name": self.emojis.get_shortcode(reaction)
         }
         await self._post("reactions", payload)
 
@@ -631,7 +645,7 @@ class MattermostBackend(ChatBackend):
     async def remove_reaction(self, channel_id: ChannelID, message_id: str, reaction: str):
         """Remove a reaction using the new _delete helper."""
         # Endpoint: /users/{user_id}/posts/{post_id}/reactions/{emoji_name}
-        endpoint = f"users/{self._user_id}/posts/{message_id}/reactions/{emoji_to_shortcode(reaction)}"
+        endpoint = f"users/{self._user_id}/posts/{message_id}/reactions/{self.emojis.get_shortcode(reaction)}"
         await self._delete(endpoint)
 
     async def mark_channel_read(self, channel_id, message_id):

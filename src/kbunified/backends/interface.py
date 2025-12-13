@@ -50,11 +50,12 @@ class ChatBackend(ABC):
         """
 
     @abstractmethod
-    async def post_message(self, channel_id: ChannelID, message_text: str):
+    async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:
         """Post a message."""
 
     @abstractmethod
-    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str):
+    async def post_reply(self, channel_id: ChannelID, thread_id: str, message_text: str,
+                         client_id: str | None = None) -> str | None:
         """Reply to a message."""
 
     @abstractmethod
