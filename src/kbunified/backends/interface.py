@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 
 type Event = dict[str, str | dict[str, str] | list[dict[str, str]]]
 type Command = dict[str, str | dict[str, str]]
@@ -110,6 +111,14 @@ class ChatBackend(ABC):
         return create_event(event=event,
                             service=dict(name=self.name, id=self._service_id),
                             **fields)
+
+    def get_local_cache_path(self, name, ext):
+        safe_name = "".join(c for c in name if c.isalnum() or c in "_-+")
+        cache_dir = Path.home() / ".cache" / "kb-solaria" / "emojis" / self._service_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        return cache_dir / f"{safe_name}.{ext}"
+
 
 def create_channel(channel_id: str, name: str, topic: str,
                    unread: bool = False, mentions: int = 0,

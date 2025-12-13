@@ -7,6 +7,7 @@ import json
 import logging
 import ssl
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -145,8 +146,8 @@ class RocketChatBackend(ChatBackend):
             h["X-User-Id"] = self._user_id
         return h
 
-    async def _request(self, method, endpoint, **kwargs):
-        url = f"{self._http_base}/api/v1/{endpoint}"
+    @asynccontextmanager
+    async def _request_url(self, method, url, **kwargs):
         async with self._session.request(
             method,
             url,
@@ -154,20 +155,28 @@ class RocketChatBackend(ChatBackend):
             ssl=self.ssl_ctx,
             **kwargs
         ) as resp:
-            try:
-                data = await resp.json()
-            except:
-                data = {}
-
             if resp.status >= 400:
-                logger.error(f"RC Req Failed {endpoint}: {data.get('error', resp.status)}")
-            return data
+                logger.error(f"RC Req Failed {url}: {resp.status}")
+            yield resp
+
+    async def _request_api(self, method, endpoint, **kwargs):
+        url = f"{self._http_base}/api/v1/{endpoint}"
+        async with self._request_url(
+            method,
+            url,
+            **kwargs
+        ) as resp:
+            try:
+                return await resp.json()
+            except Exception:
+                logger.exception("Could not get a valid response!")
+                return {}
 
     async def _get(self, endpoint, **params):
-        return await self._request("GET", endpoint, params=params)
+        return await self._request_api("GET", endpoint, params=params)
 
     async def _post(self, endpoint, payload):
-        return await self._request("POST", endpoint, json=payload)
+        return await self._request_api("POST", endpoint, json=payload)
 
     async def _download_file(self, url, path):
         if not url.startswith("http"):
@@ -286,17 +295,32 @@ class RocketChatBackend(ChatBackend):
     async def fetch_all_users(self):
         try:
             logger.debug("Fetching RC users...")
-            data = await self._get("users.list", count=200)
-            for u in data.get("users", []):
-                self._users[u["_id"]] = {
-                    "id": u["_id"],
-                    "name": u["username"],
-                    "real_name": u.get("name"),
-                    "color": str_to_color(u["_id"])
-                }
+            offset = 0
+            count = 200
+
+            while True:
+                # Rocket.Chat uses 'offset' and 'count' for pagination
+                data = await self._get("users.list", count=count, offset=offset)
+                users = data.get("users", [])
+
+                if not users:
+                    break
+
+                for u in users:
+                    self._users[u["_id"]] = {
+                        "id": u["_id"],
+                        "name": u["username"],
+                        "real_name": u.get("name"),
+                        "color": str_to_color(u["_id"])
+                    }
+                    print(u)
+
+                offset += count
+
             logger.debug(f"Fetched {len(self._users)} RC users")
         except Exception:
             logger.exception("User fetch failed")
+
 
     @override
     async def events(self) -> AsyncGenerator[Event]:
@@ -336,7 +360,7 @@ class RocketChatBackend(ChatBackend):
     @alru_cache
     async def get_state_events(self):
         """Get the current state event for the backend."""
-        # ws_task = asyncio.create_task(self.fetch_custom_emojis())
+        ws_task = asyncio.create_task(self.fetch_custom_emojis())
         await self.fetch_all_users()
 
         info_event = self.create_event(event="self_info", user={
@@ -344,7 +368,16 @@ class RocketChatBackend(ChatBackend):
             "name": self._username,
             "color": str_to_color(self._user_id)
         })
-        user_list_event = self.create_event(event="user_list", users=list(self._users.values()))
+
+        user_list = []
+        for u in self._users.values():
+            user_list.append({
+                "id": u["id"],
+                "name": u["real_name"] or u["username"],
+                "color": str_to_color(u["id"])
+            })
+
+        user_list_event = self.create_event(event="user_list", users=user_list)
 
         channels = await self.get_subbed_channels()
         channel_list_event = self.create_event(event="channel_list", channels=[asdict(c) for c in channels])
@@ -494,22 +527,28 @@ class RocketChatBackend(ChatBackend):
 
         await self._send_ws(msg)
 
-    # async def fetch_custom_emojis(self):
-    #     try:
-    #         data = await self._get("emoji-custom.list")
-    #         if data.get("success"):
-    #             base_url = self._http_base
-    #             print(data)
-    #             for em in data.get("emojis", []):
-    #                 name = em["name"]
-    #                 ext = em.get("extension", "png")
-    #                 url = f"{base_url}/emoji-custom/{name}.{ext}"
-    #
-    #                 self.emojis.register_custom(name, url)
-    #                 for alias in em.get("aliases", []):
-    #                     self.emojis.register_custom(alias, url)
-    #     except Exception:
-    #         logger.exception("Failed to fetch RC custom emojis")
+    async def fetch_custom_emojis(self):
+        try:
+            data = await self._get("emoji-custom.all")
+            if data.get("success"):
+                for em in data.get("emojis", []):
+                    name, local_path = await self._cache_emoji(em)
+                    self.emojis.register_custom(name, local_path)
+                    for alias in em.get("aliases", []):
+                        self.emojis.register_alias(alias, name)
+        except Exception:
+            logger.exception("Failed to fetch RC custom emojis")
+
+    async def _cache_emoji(self, em):
+        name = em["name"]
+        ext = em.get("extension", "png")
+        url = f"{self._http_base}/emoji-custom/{name}.{ext}"
+        local_path = self.get_local_cache_path(name, ext)
+        async with self._request_url("GET", url) as resp:
+            if resp.status == 200:
+                with open(local_path, "wb") as f:
+                    f.write(await resp.read())
+        return name, local_path
 
     @override
     async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:
