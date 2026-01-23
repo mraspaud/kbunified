@@ -15,7 +15,7 @@ class Channel:
     id: str
     name: str
     topic: str = ""
-    unread: bool = False
+    unread: int = 0
     mentions: int = 0
     starred: bool = False
     last_read_at: float = 0.0
@@ -102,6 +102,13 @@ class ChatBackend(ABC):
         """Return a list of thread IDs the user is participating in."""
         return []
 
+    async def stage_file(self, data: str, filename: str, mime_type: str) -> str | None:
+        """Stage or upload a file to the service and returns a remote File ID.
+
+        Does NOT post a message.
+        """
+        pass
+
     @abstractmethod
     async def close(self):
         """Close the connection to the service and shut down."""
@@ -121,7 +128,7 @@ class ChatBackend(ABC):
 
 
 def create_channel(channel_id: str, name: str, topic: str,
-                   unread: bool = False, mentions: int = 0,
+                   unread: int = 0, mentions: int = 0,
                    starred: bool = False, last_read_at: float = 0.0, category: str = "channel"):
     """Create a channel."""
     return dict(id=channel_id, name=name,

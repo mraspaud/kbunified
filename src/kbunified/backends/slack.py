@@ -337,7 +337,7 @@ class SlackBackend(ChatBackend):
                 chan = Channel(id=channel_id,
                                name=name,
                                topic=channel["topic"]["value"],
-                               unread=meta.get("has_unreads", False),
+                               unread=1 if meta.get("has_unreads", False) else 0,
                                mentions=meta.get("mention_count", 0),
                                starred=channel_id in data["starred"],
                                last_read_at=last_read,
@@ -365,7 +365,7 @@ class SlackBackend(ChatBackend):
                 chan = Channel(id=channel_id,
                                name=user_name,
                                topic=f"Conversation with {user_name}",
-                               unread=meta.get("has_unreads", False),
+                               unread=1 if meta.get("has_unreads", False) else 0,
                                mentions=meta.get("mention_count", 0),
                                starred=channel_id in data.get("starred", []),
                                last_read_at=last_read,
@@ -466,7 +466,8 @@ class SlackBackend(ChatBackend):
             if subtype == "message_changed":
                 new_json = json_data["message"]
                 new_json["channel"] = json_data["channel"]
-                body = self.emojis.replace_text(new_json["text"])
+                raw_text = self._extract_message_body(new_json)
+                body = self.emojis.replace_text(raw_text)
                 body = await self.replace_mentions_in_text(body)
 
                 return self.create_event(
@@ -485,6 +486,10 @@ class SlackBackend(ChatBackend):
                 new_json = json_data["message"]
                 new_json["channel"] = json_data["channel"]
                 return await self.create_message_event_from_json(new_json)
+            elif subtype == "bot_message":
+                if "user" in json_data:
+                    asyncio.create_task(self.fetch_user(json_data["user"]))
+                return await self.create_message_event_from_json(json_data)
             elif not subtype:
                 asyncio.create_task(self.fetch_user(json_data["user"]))
                 return await self.create_message_event_from_json(json_data)
@@ -503,6 +508,70 @@ class SlackBackend(ChatBackend):
             )
 
         return None
+
+    def _extract_message_body(self, blob) -> str:
+        """Extract actionable text from a Slack message blob."""
+        text = blob.get("text", "")
+        sourced_from_attachments = False
+
+        # 1. Fallback/Extraction for bot messages (GitHub, etc.) using attachments
+        # We only do this if the main 'text' is empty.
+        if not text and "attachments" in blob:
+            parts = []
+            for att in blob["attachments"]:
+                att_parts = []
+
+                # Pretext
+                if "pretext" in att:
+                    att_parts.append(att["pretext"])
+
+                # Title
+                if "title" in att:
+                    if "title_link" in att:
+                        att_parts.append(f"[{att['title']}]({att['title_link']})")
+                    else:
+                        att_parts.append(f"**{att['title']}**")
+
+                # Text
+                if "text" in att:
+                    att_parts.append(att["text"])
+
+                # Fields
+                if "fields" in att:
+                    for f in att["fields"]:
+                        att_parts.append(f"**{f.get('title')}**: {f.get('value')}")
+
+                if att_parts:
+                    parts.append("\n".join(att_parts))
+                elif "fallback" in att:
+                    parts.append(att["fallback"])
+
+            if parts:
+                text = "\n\n".join(parts)
+
+            # 2. SANITIZATION (Only for attachments/bots)
+            # If the text came from a bot attachment, we sanitize it to prevent
+            # ASCII tables from breaking the markdown renderer.
+            # Fix Codecov artifacts: broken link syntax [text](<url>)
+            text = re.sub(r"\]\(<([^>]+)>\)", r"](\1)", text)
+
+            # Escape vertical bars to prevent accidental table rendering
+            text = text.replace("|", "\\|")
+
+            # Escape characters that create headers or lists at the start of lines.
+            # # -> ATX Headers
+            # =, - -> Setext Headers (underlines) and Horizontal Rules
+            # + -> Lists
+            text = re.sub(r"(^|\n)(#+|=+|-+|\++)", r"\1\\\2", text)
+
+        # 3. UNIVERSAL CLEANUP (Applies to everyone)
+        # Convert Slack-style links <url|text> -> [text](url)
+        text = re.sub(r"<([^|]+)\|([^>]+)>", r"[\2](\1)", text)
+        # Convert bare links <url> -> url
+        text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+
+        return text
+
 
     def register_user(self, user_info):
         uid = user_info["id"]
@@ -598,7 +667,8 @@ class SlackBackend(ChatBackend):
             else:
                 author = dict(id="bot", name=blob.get("username", "Bot"), color="#cccccc")
 
-            text = blob.get("text", "")
+            text = self._extract_message_body(blob)
+
             body = self.emojis.replace_text(text)
             body = await self.replace_mentions_in_text(body)
 

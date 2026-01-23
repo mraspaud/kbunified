@@ -196,6 +196,14 @@ async def main(args=None):
                 elif cmd["command"] == "typing":
                     if hasattr(service, "set_typing_status"):
                         await service.set_typing_status(cmd["channel_id"])
+                elif cmd["command"] == "stage_file":
+                    if cmd.get("client_id"):
+                        # FIXME: This should not be broadcasted, just send to the relevant frontend
+                        await ui_api.broadcast_event({
+                           "event": "staging_complete",
+                           "client_id": cmd["client_id"], # The temp ID from frontend
+                           "file_id": cmd["filename"]             # The real (or staged) ID
+                        })
                 else:
                     logger.warning(f"Received unknown command: {cmd.get('command')}")
             except Exception as e:

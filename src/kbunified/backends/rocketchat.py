@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import ssl
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -95,6 +96,7 @@ class RocketChatBackend(ChatBackend):
         self._channels = {}
         self._room_types = {}
         self.emojis = EmojiManager()
+        self._staged_files = dict()
 
     async def _ddp_heartbeat(self):
         """Sends a DDP-level ping every 30 seconds to keep the session alive."""
@@ -278,7 +280,7 @@ class RocketChatBackend(ChatBackend):
                     id=cid,
                     name=name,
                     topic=sub.get("topic", ""),
-                    unread=sub.get("unread", 0) > 0,
+                    unread=sub.get("unread", 0),
                     mentions=sub.get("userMentions", 0),
                     starred=sub.get("f", False),
                     last_read_at=last_read,
@@ -549,6 +551,16 @@ class RocketChatBackend(ChatBackend):
                 with open(local_path, "wb") as f:
                     f.write(await resp.read())
         return name, local_path
+
+    async def stage_file(self, data: str, filename: str, mime_type: str) -> str | None:
+        temp_id = str(uuid.uuid4())
+        self._staged_files[temp_id] = {
+            "data": data,
+            "filename": filename,
+            "mime": mime_type,
+        }
+        logger.debug(f"Staged file {filename} ({len(data)} bytes) with ID {temp_id}")
+        return temp_id
 
     @override
     async def post_message(self, channel_id: ChannelID, message_text: str, client_id: str | None = None) -> str | None:

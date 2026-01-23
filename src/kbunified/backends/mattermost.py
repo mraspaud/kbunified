@@ -159,7 +159,7 @@ class MattermostBackend(ChatBackend):
                 total_msgs = chan["total_msg_count"]
                 my_msgs = my_data["msg_count"]
 
-                unread = (total_msgs - my_msgs) > 0
+                unread = max(0, total_msgs - my_msgs)
 
                 # --- NAME RESOLUTION ---
                 display_name = chan["display_name"] or chan["name"]
@@ -657,16 +657,14 @@ class MattermostBackend(ChatBackend):
     async def set_typing_status(self, channel_id: ChannelID):
         """Send a typing event via WebSocket."""
         # Mattermost expects typing events over the websocket to show up instantly
-        if self._ws:
-            payload = {
-                "action": "user_typing",
-                "seq": 1,
-                "data": {
-                    "channel_id": channel_id,
-                    "parent_id": "" # Add thread_id support here later if needed
-                }
-            }
-            await self._ws.send(json.dumps(payload))
+
+        payload = {
+            "channel_id": channel_id,
+            # "parent_id": "" # Add thread_id support here later if needed
+        }
+        data = await self._post(f"users/{self._user_id}/typing", payload=payload)
+        logger.debug("Sending typing on mattermost")
+        return data
 
     def replace_display_names_with_username(self, text: str) -> str:
         """Convert @Display Name to @username for outbound messages."""
