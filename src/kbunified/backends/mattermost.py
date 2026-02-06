@@ -297,29 +297,37 @@ class MattermostBackend(ChatBackend):
     async def _delete(self, endpoint):
         return await self._request("DELETE", endpoint)
 
+    async def _connection_loop(self):
+        """WebSocket connection loop with automatic reconnection."""
+        attempt = 0
+        while self._running:
+            try:
+                await self.connect_ws()
+                logger.info("Mattermost WebSocket connected")
+                attempt = 0  # Reset on successful connection
+                async for msg in self._ws:
+                    if msg.type == WSMsgType.TEXT:
+                        await self._inbox.put(msg.data)
+                    elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
+                        logger.warning(f"Mattermost WS {msg.type.name}, reconnecting...")
+                        break
+            except Exception as e:
+                logger.error(f"Mattermost WS error: {e}")
+
+            if self._running:
+                delay = self._get_reconnect_delay(attempt)
+                logger.info(f"Mattermost: reconnecting in {delay:.1f}s (attempt {attempt + 1})...")
+                await asyncio.sleep(delay)
+                attempt += 1
+
     async def events(self) -> AsyncGenerator[Event]:
         """Yield real-time events."""
         await self._login_event.wait()
-        await self.connect_ws()
 
         for event in await self.get_state_events():
             yield event
 
-        async def over_ws():
-            try:
-                async for msg in self._ws:
-                    if msg.type == WSMsgType.TEXT:
-                        await self._inbox.put(msg.data)
-                    elif msg.type == WSMsgType.ERROR:
-                        logger.error(f"WS Error: {msg.data}")
-                        break
-                    elif msg.type == WSMsgType.CLOSED:
-                        logger.debug("WS Closed")
-                        break
-            except Exception:
-                logger.exception("Error in WS loop")
-
-        ws_task = asyncio.create_task(over_ws())
+        ws_task = asyncio.create_task(self._connection_loop())
         try:
             while self._running:
                 json_event = await self._inbox.get()

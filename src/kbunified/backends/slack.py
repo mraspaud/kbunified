@@ -388,18 +388,35 @@ class SlackBackend(ChatBackend):
                             service=dict(name=self.name, id=self._service_id),
                             **fields)
 
+    async def _connection_loop(self):
+        """WebSocket connection loop with automatic reconnection."""
+        attempt = 0
+        while self._running:
+            try:
+                await self.connect_ws()
+                logger.info("Slack WebSocket connected")
+                attempt = 0  # Reset on successful connection
+                async for msg in self._ws:
+                    # websockets library yields strings/bytes directly;
+                    # aiohttp yields WSMessage objects with .data
+                    data = msg.data if hasattr(msg, 'data') else msg
+                    await self._inbox.put(data)
+            except Exception as e:
+                logger.error(f"Slack WS error: {e}")
+
+            if self._running:
+                delay = self._get_reconnect_delay(attempt)
+                logger.info(f"Slack: reconnecting in {delay:.1f}s (attempt {attempt + 1})...")
+                await asyncio.sleep(delay)
+                attempt += 1
+
     async def events(self) -> AsyncGenerator[Event]:
         await self._login_event.wait()
-        await self.connect_ws()
 
         for event in await self.get_state_events():
             yield event
 
-        async def over_ws():
-            async for event in self._ws:
-                await self._inbox.put(event)
-
-        ws_task = asyncio.create_task(over_ws())
+        ws_task = asyncio.create_task(self._connection_loop())
         try:
             while self._running:
                 message = await self._inbox.get()

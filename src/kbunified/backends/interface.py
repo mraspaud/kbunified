@@ -1,5 +1,6 @@
 """Common interface for chat backends."""
 
+import random
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -125,6 +126,15 @@ class ChatBackend(ABC):
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         return cache_dir / f"{safe_name}.{ext}"
+
+    def _get_reconnect_delay(self, attempt: int) -> float:
+        """Calculate reconnect delay with exponential backoff and jitter.
+
+        Returns delay in seconds: 1s, 2s, 4s, 8s, ... capped at 30s, plus 25% jitter.
+        """
+        base = min(30, 1 * (2 ** attempt))
+        jitter = base * 0.25 * random.random()
+        return base + jitter
 
 
 def create_channel(channel_id: str, name: str, topic: str,
